@@ -1,0 +1,64 @@
+# ---------------------------------------------------------------------------
+# APatch / KernelPatch build fragment
+# merged on top of arch/arm64/configs/earth_defconfig
+#
+# APatch patches the kernel image directly, so the kernel must expose a
+# complete, parseable kallsyms table.  CONFIG_KALLSYMS_ALL is mandatory;
+# without it kptools fails with "analyze_kallsym_info error" / "can't locate
+# vectors".
+#
+# NOTE: CONFIG_KALLSYMS_ALL depends on CONFIG_DEBUG_KERNEL, and this vendor
+# defconfig does not enable DEBUG_KERNEL (it has no default).  If DEBUG_KERNEL
+# is left off, KALLSYMS_ALL becomes invisible and `make olddefconfig` silently
+# drops it again.  Both symbols must be set here.
+#
+# KernelSU / KPM are deliberately NOT enabled: APatch is the root solution and
+# brings its own module loader (KernelPatch modules, .kpm).
+# ---------------------------------------------------------------------------
+
+# --- kallsyms for APatch/KernelPatch ---------------------------------------
+CONFIG_DEBUG_KERNEL=y
+CONFIG_KALLSYMS=y
+CONFIG_KALLSYMS_ALL=y
+
+# --- process memory read/write helpers -------------------------------------
+CONFIG_CROSS_MEMORY_ATTACH=y
+CONFIG_PROC_PAGE_MONITOR=y
+CONFIG_PROC_KCORE=y
+CONFIG_CHECKPOINT_RESTORE=y
+CONFIG_USER_NS=y
+
+# --- kernel modules (kept for normal LKM tooling) --------------------------
+CONFIG_MODULES=y
+CONFIG_KPROBES=y
+
+# Symbol CRCs are only needed to load out-of-tree modules built against this
+# exact kernel.  APatch/KernelPatch hooks inline, it does not load a .ko, and
+# the legacy genksyms path is what breaks the mali_valhall build:
+#   ld: cannot open linker script file .../.tmp_mali_kbase_pm_always_on.ver
+# (a genksyms/.ver race on that vendor makefile).  Turning this off removes
+# the whole cmd_modversions_c step.
+# CONFIG_MODVERSIONS is not set
+
+# --- deterministic (non-PIE) link ------------------------------------------
+# APatch's kptools reconstructs symbol addresses from the raw Image.  On arm64
+# CONFIG_RELOCATABLE makes the link PIE (-shared -Bsymbolic -z notext plus
+# --no-apply-dynamic-relocs with GNU ld), which leaves every relocated site at
+# zero in the file and keeps the real values in .rela.dyn.  kptools then cannot
+# find kallsyms_addresses ("find approximate kallsyms_addresses error") and its
+# own relocation pass uses a wrong base for this vendor layout, so the image
+# ends up unusable.
+#
+# The stock earth kernel is not PIE: its kallsyms table holds absolute
+# addresses.  RANDOMIZE_BASE is the only symbol that selects RELOCATABLE on
+# arm64, so turning KASLR off restores exactly the stock link model.  Side
+# effect: ARM64_MODULE_PLTS goes away with it; no out-of-tree modules are used.
+# CONFIG_RANDOMIZE_BASE is not set
+
+# --- GCC build: drop clang-only hardening + debug info ---------------------
+# These are only buildable with clang; GCC turns them off by itself, but
+# stating it explicitly keeps the generated .config honest and greppable.
+# CONFIG_LTO_CLANG is not set
+# CONFIG_CFI_CLANG is not set
+# CONFIG_SHADOW_CALL_STACK is not set
+# CONFIG_DEBUG_INFO is not set

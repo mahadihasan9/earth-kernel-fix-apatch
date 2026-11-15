@@ -1,0 +1,3 @@
+# The build image installs tooling only; it never copies the workspace in.
+# Docker still tars the whole context before starting a build, so keep it empty.
+*

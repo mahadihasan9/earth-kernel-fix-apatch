@@ -1,0 +1,6 @@
+# Keep files byte-for-byte identical to what is in the working tree.
+#
+# The vendor kernel tree contains files with CRLF line endings.  With
+# core.autocrlf=input (a common Windows/VS Code default) git would silently
+# rewrite those on commit, so disable all end-of-line conversion here.
+* -text

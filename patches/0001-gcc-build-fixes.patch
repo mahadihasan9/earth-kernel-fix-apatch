@@ -1,0 +1,131 @@
+From d71f5e81f6e79b02836ee766fa837ccd2adcfa96 Mon Sep 17 00:00:00 2001
+From: kernel-build <kernel-build@localhost>
+Date: Sun, 15 Nov 2026 19:25:27 +0600
+Subject: [PATCH] build: fix GCC-only compile errors in vendor tree
+
+The vendor tree is normally built with AOSP clang; GCC 11 rejects a few
+constructs that clang accepts.  Keep the changes minimal:
+
+- keyslot-manager/blk-crypto: ksm_flock() and blk_crypto_flock() were
+  declared and defined as plain 'inline' but are called from other
+  translation units.  In this tree 'inline' expands to always_inline, so
+  GCC fails with "inlining failed ... function body not available".
+  Drop 'inline' from the declaration and definition; they are ordinary
+  EXPORT_SYMBOL_GPL functions.
+
+- mali midgard Kbuild: add .NOTPARALLEL:.  The subtree lists objects both
+  directly and through the composite mali_kbase-y list, so a parallel
+  build can run the same .tmp_<obj> rule twice; with CONFIG_MODVERSIONS
+  that fails with "ld: cannot open linker script file .../.ver".
+
+- gen4m fw_dl.c: replace two strncpy(dst, src, sizeof(src)) calls with
+  memcpy.  sizeof() of the uint8_t[] source triggers
+  -Werror=sizeof-pointer-memaccess on GCC (false positive); the
+  destinations are zeroed beforehand so the result is identical.
+---
+ block/blk-crypto.c                                   |  2 +-
+ block/keyslot-manager.c                              |  2 +-
+ .../mali-r32p1/drivers/gpu/arm/midgard/Kbuild        |  8 ++++++++
+ .../wlan/core/gen4m/chips/common/fw_dl.c             | 12 ++++++++++--
+ include/linux/blk-crypto.h                           |  2 +-
+ include/linux/keyslot-manager.h                      |  2 +-
+ 6 files changed, 22 insertions(+), 6 deletions(-)
+
+diff --git a/block/blk-crypto.c b/block/blk-crypto.c
+index f15ed0b70..703700d9b 100644
+--- a/block/blk-crypto.c
++++ b/block/blk-crypto.c
+@@ -305,7 +305,7 @@ int blk_crypto_evict_key(struct request_queue *q,
+ }
+ EXPORT_SYMBOL_GPL(blk_crypto_evict_key);
+ 
+-inline void blk_crypto_flock(struct keyslot_manager *ksm, unsigned int flags)
++void blk_crypto_flock(struct keyslot_manager *ksm, unsigned int flags)
+ {
+ 	ksm_flock(ksm, flags);
+ }
+diff --git a/block/keyslot-manager.c b/block/keyslot-manager.c
+index ef3ca04f9..76ecb16be 100644
+--- a/block/keyslot-manager.c
++++ b/block/keyslot-manager.c
+@@ -680,7 +680,7 @@ EXPORT_SYMBOL_GPL(keyslot_manager_derive_raw_secret);
+  * detection, set another lock sub-class could avoid it.
+  *
+  */
+-inline void ksm_flock(struct keyslot_manager *ksm, unsigned int flags)
++void ksm_flock(struct keyslot_manager *ksm, unsigned int flags)
+ {
+ 	ksm->lock_flags = flags;
+ }
+diff --git a/drivers/gpu/mediatek/gpu_mali/mali_valhall/mali-r32p1/drivers/gpu/arm/midgard/Kbuild b/drivers/gpu/mediatek/gpu_mali/mali_valhall/mali-r32p1/drivers/gpu/arm/midgard/Kbuild
+index e0fc678c0..2e8930c97 100644
+--- a/drivers/gpu/mediatek/gpu_mali/mali_valhall/mali-r32p1/drivers/gpu/arm/midgard/Kbuild
++++ b/drivers/gpu/mediatek/gpu_mali/mali_valhall/mali-r32p1/drivers/gpu/arm/midgard/Kbuild
+@@ -265,3 +265,11 @@ else
+ # out-of-tree
+     include $(INCLUDE_SUBDIR)
+ endif
++
++# MTK: this subtree lists objects that are also pulled in through the
++# composite mali_kbase-y list, so a global -j build can run the same
++# .tmp_<obj> rule in two shells.  With CONFIG_MODVERSIONS that shows up as
++#   ld: cannot open linker script file .../.tmp_<obj>.ver
++# because one shell removes the other temporary file.  Keep this directory
++# serial; it is a few hundred small files and costs little.
++.NOTPARALLEL:
+diff --git a/drivers/misc/mediatek/connectivity/wlan/core/gen4m/chips/common/fw_dl.c b/drivers/misc/mediatek/connectivity/wlan/core/gen4m/chips/common/fw_dl.c
+index 0ab956a3c..4c634fc2c 100644
+--- a/drivers/misc/mediatek/connectivity/wlan/core/gen4m/chips/common/fw_dl.c
++++ b/drivers/misc/mediatek/connectivity/wlan/core/gen4m/chips/common/fw_dl.c
+@@ -2034,7 +2034,12 @@ uint32_t wlanGetHarvardTailerInfo(IN struct ADAPTER
+ 		       prTailers[u4SecIdx].feature_set);
+ 
+ 		kalMemZero(aucBuf, 32);
+-		kalStrnCpy(aucBuf, prTailers[u4SecIdx].ram_version,
++		/* memcpy instead of strncpy: with GCC, strncpy(dst, src,
++		 * sizeof(src)) on an array member trips
++		 * -Werror=sizeof-pointer-memaccess (a false positive).  The
++		 * buffer is pre-zeroed, so the resulting C string is identical.
++		 */
++		kalMemCopy(aucBuf, prTailers[u4SecIdx].ram_version,
+ 			   sizeof(prTailers[u4SecIdx].ram_version));
+ 		DBGLOG(INIT, INFO, "date[%s] version[%s]\n",
+ 		       prTailers[u4SecIdx].ram_built_date, aucBuf);
+@@ -2063,7 +2068,10 @@ uint32_t wlanGetConnacTailerInfo(IN struct WIFI_VER_INFO *prVerInfo,
+ 		   sizeof(struct TAILER_COMMON_FORMAT_T));
+ 
+ 	kalMemZero(aucBuf, 32);
+-	kalStrnCpy(aucBuf, prComTailer->aucRamVersion,
++	/* see the comment above: strncpy with sizeof() of an array member is a
++	 * GCC false positive; the buffer is already zeroed.
++	 */
++	kalMemCopy(aucBuf, prComTailer->aucRamVersion,
+ 		   sizeof(prComTailer->aucRamVersion));
+ 
+ 	/* Dump image information */
+diff --git a/include/linux/blk-crypto.h b/include/linux/blk-crypto.h
+index 13c45efa7..6f6b3e90f 100644
+--- a/include/linux/blk-crypto.h
++++ b/include/linux/blk-crypto.h
+@@ -30,7 +30,7 @@ int blk_crypto_start_using_mode(enum blk_crypto_mode_num crypto_mode,
+ int blk_crypto_evict_key(struct request_queue *q,
+ 			 const struct blk_crypto_key *key);
+ 
+-inline void blk_crypto_flock(struct keyslot_manager *ksm, unsigned int flags);
++void blk_crypto_flock(struct keyslot_manager *ksm, unsigned int flags);
+ 
+ 
+ #else /* CONFIG_BLK_INLINE_ENCRYPTION */
+diff --git a/include/linux/keyslot-manager.h b/include/linux/keyslot-manager.h
+index e247be8a5..631d8e311 100644
+--- a/include/linux/keyslot-manager.h
++++ b/include/linux/keyslot-manager.h
+@@ -98,7 +98,7 @@ int keyslot_manager_derive_raw_secret(struct keyslot_manager *ksm,
+ 				      unsigned int wrapped_key_size,
+ 				      u8 *secret, unsigned int secret_size);
+ 
+-inline void ksm_flock(struct keyslot_manager *ksm, unsigned int flags);
++void ksm_flock(struct keyslot_manager *ksm, unsigned int flags);
+ 
+ #endif /* CONFIG_BLK_INLINE_ENCRYPTION */
+ 

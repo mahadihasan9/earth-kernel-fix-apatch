@@ -1,0 +1,4 @@
+zImage
+vmlinux*
+!vmlinux.scr
+uImage*

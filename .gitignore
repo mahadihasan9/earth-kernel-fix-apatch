@@ -1,0 +1,32 @@
+# ---------------------------------------------------------------------------
+# Build output
+# ---------------------------------------------------------------------------
+/out/
+/output/
+*.log
+
+# ---------------------------------------------------------------------------
+# Files copied into anykernel3/ at packaging time by scripts/make-zip.sh
+#
+# The kernel source tree itself IS part of this repository (see
+# android_kernel_xiaomi_earth/).  Only the generated images are ignored.
+# ---------------------------------------------------------------------------
+/anykernel3/Image
+/anykernel3/Image.gz
+/anykernel3/Image.gz-dtb
+/anykernel3/dtb
+/anykernel3/dtbo.img
+
+# ---------------------------------------------------------------------------
+# KernelPatch tools (download them into tools/, see tools/README.md)
+# ---------------------------------------------------------------------------
+/tools/kptools-linux
+/tools/kpimg-linux
+*.kpm
+
+# ---------------------------------------------------------------------------
+# Misc
+# ---------------------------------------------------------------------------
+__pycache__/
+*.pyc
+.DS_Store

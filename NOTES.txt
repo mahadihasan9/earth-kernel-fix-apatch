@@ -1,0 +1,312 @@
+================================================================================
+ Earth kernel — technical notes
+ Companion to README.md.  Details that are easy to get wrong when rebuilding
+ this kernel for APatch.
+================================================================================
+
+1. Scope
+--------------------------------------------------------------------------------
+ Device:  Xiaomi earth (Redmi 12C / POCO C55, MT6768), LineageOS 24.0
+ Kernel:  Linux 4.19.325-cip136-st20 (android_kernel_xiaomi_earth, lineage-24.0)
+ Root:    APatch / KernelPatch.  No KernelSU, no SukiSU, no KPM code in-tree.
+
+ This repository builds the kernel, verifies that KernelPatch can patch it, and
+ repacks a boot image in the stock layout.  It does not modify the ramdisk and
+ does not re-sign AVB.
+
+
+2. Kernel config that matters
+--------------------------------------------------------------------------------
+ Mandatory:
+   CONFIG_DEBUG_KERNEL=y
+   CONFIG_KALLSYMS=y
+   CONFIG_KALLSYMS_ALL=y
+
+ CONFIG_KALLSYMS_ALL depends on CONFIG_DEBUG_KERNEL, and earth_defconfig does
+ not enable DEBUG_KERNEL (the symbol has no default).  If only KALLSYMS_ALL is
+ written into a fragment, `make olddefconfig` makes it invisible and silently
+ drops it again.  Both must be set.
+
+ Forced off:
+   CONFIG_RANDOMIZE_BASE           (see section 6: keeps the link non-PIE)
+   CONFIG_LTO_CLANG, CONFIG_CFI_CLANG, CONFIG_SHADOW_CALL_STACK,
+   CONFIG_DEBUG_INFO               (clang-only, or useless without DEBUG_INFO)
+
+ Kept:
+   CONFIG_CROSS_MEMORY_ATTACH, CONFIG_PROC_PAGE_MONITOR, CONFIG_PROC_KCORE,
+   CONFIG_PTRACE, CONFIG_CHECKPOINT_RESTORE, CONFIG_USER_NS, CONFIG_KPROBES
+
+ CONFIG_MODVERSIONS cannot be disabled: the vendor symbol
+ CONFIG_ANDROID_DEFAULT_SETTING (drivers/misc/mediatek/Kconfig.default) does
+ "select MODVERSIONS", and a select wins over defconfig/fragments.  It is
+ harmless; .kpm modules do not use symbol CRCs.
+
+ The fragment is merged with scripts/kconfig/merge_config.sh -m, then
+ `make olddefconfig` resolves dependencies.
+
+ GCC 11 also needs a few warning suppressions (docker/kernel-build.sh,
+ KCFLAGS): memset-elt-size, stringop-truncation, stringop-overflow,
+ array-bounds, address-of-packed-member, format-overflow,
+ maybe-uninitialized, unused-but-set-variable, misleading-indentation,
+ format-truncation.  -Werror itself stays on: real errors must still fail.
+
+
+3. Boot image layout (MTK / boot header v2)
+--------------------------------------------------------------------------------
+ Android boot header v2, page size 2048, 64 MiB partition:
+
+   offset 0      header page (kernel_addr 0x40080000, ramdisk_addr 0x47c80000,
+                 tags/dtb addr 0x4bc80000, dtb_size 142930, cmdline ...)
+   then          kernel (gzip) | ramdisk (gzip) | second (empty) |
+                 recovery_dtbo (empty) | dtb (142930 bytes)
+   then          vbmeta blob (0x1da0000, 1536 bytes)
+   end - 64      AVB footer, big-endian, magic "AVBf" at 0x3ffffc0
+
+ The DTB is a separate header field, not appended to the kernel, so the kernel
+ that goes into the image is a plain Image.gz (never Image.gz-dtb, which would
+ also build every MTK dtb).
+
+ Because the DTB lives in the boot image, AnyKernel3 packages must not ship or
+ overwrite dtb/dtbo: anykernel.sh in this repo only installs Image.gz.
+
+
+4. Repacker rules (scripts/repack-boot.py)
+--------------------------------------------------------------------------------
+ Everything except the kernel is preserved byte-for-byte:
+
+   - the whole header page is copied from the template
+   - kernel_size at 0x08 is patched
+   - the legacy SHA-1 "id" at 0x240 is recomputed the way mkbootimg does
+     (five blobs, each followed by its 32-bit length)
+   - blobs are written with 2048-byte alignment
+   - the AVB tail (vbmeta + footer) is copied verbatim while the new body ends
+     before vbmeta_offset, zero-filling the gap; if it would overflow, the tail
+     is dropped and the image is zero-padded to 64 MiB (--strip-avb forces it)
+   - output is always exactly 64 MiB
+
+ The AVB hash covers the stock kernel, so it is stale by definition and cannot
+ be recomputed (the signing key is not public).  With an unlocked bootloader
+ verification is not enforced, so keeping the tail only preserves the stock
+ layout.
+
+ Self-test: repacking the stock image with the stock kernel must reproduce
+ boot-stock-lineage.img byte-for-byte.  Any change to the repacker has to keep
+ that property.
+
+
+5. APatch verification (scripts/verify-patch.sh)
+--------------------------------------------------------------------------------
+ Tool: KernelPatch kptools + kpimg (0.13.9 was used), placed in tools/.
+
+ The verifier runs the same operation the APatch app performs:
+
+   kptools -p -i out/arch/arm64/boot/Image -k kpimg-linux -o /tmp/Image.patched
+
+ Success = exit code 0, no "analyze_kallsym_info error", no "can't locate
+ vectors", and a non-empty patched image.  A healthy run resolves
+ kallsyms_lookup_name, printk, panic, rest_init, kernel_init, copy_process,
+ avc_denied, input_handle_event, paging_init and ends with "patch done".
+
+ "no CFI failure handler symbol" messages are expected (CFI is off).
+
+ Patching the finished boot.img directly also works:
+
+   kptools -p -i output/boot.img -k kpimg-linux -o /tmp/boot-patched.img
+   -> "Preserved original AVB metadata ..." / "Repack completed"
+
+ and leaves the ramdisk and DTB untouched while the kernel grows by the kpimg
+ payload (~76 KB).
+
+ Real-world confirmation: a boot image patched with the APatch app (0.13.9)
+ from output/boot.img keeps the ramdisk and DTB byte-for-byte, grows the kernel
+ by ~99 KB, and the decompressed kernel contains the "KernelPatch" marker while
+ still reporting "Linux version 4.19.325-cip136-st20-gd71f5e81f6e7".
+
+
+6. Why a PIE link breaks kptools
+--------------------------------------------------------------------------------
+ Symptom with KALLSYMS_ALL enabled but a PIE link:
+
+   [+] linux_banner 1: Linux version 4.19.325-...       (banner found)
+   [+] kallsyms_names offset: ...
+   [+] arm64 relocation kernel_va: 0xffffff8010000000
+   [+] arm64 relocation table range: [0x01a44f18, 0x01f0acb0), count: 0x32e91
+   [+] try kallsyms_offsets first for 64-bit relative-base kernel
+   [?] find approximate kallsyms_offsets error
+   [+] fallback to kallsyms_addresses scan
+   [-] find_approx_addresses(); find approximate kallsyms_addresses error
+
+ Cause: arch/arm64/Makefile links with
+
+   LDFLAGS_vmlinux += -shared -Bsymbolic -z notext \
+                      $(call ld-option, --no-apply-dynamic-relocs)
+
+ when CONFIG_RELOCATABLE=y (selected by CONFIG_RANDOMIZE_BASE).  With GNU ld,
+ --no-apply-dynamic-relocs leaves every relocated site at ZERO in the file; the
+ real values live in .rela.dyn and are applied at boot.  kallsyms_addresses is
+ one of those arrays, so the raw Image has zeros where kptools expects the
+ address table.
+
+ kptools' own relocation pass does not save us: for this layout it reports
+ kernel_va 0xffffff8010000000 while the image is linked at 0xffffff8010080000
+ (TEXT_OFFSET 0x80000), so it would write 0x80000 off.
+
+ The stock kernel has absolute addresses in the file, i.e. it is not PIE.
+ Therefore CONFIG_RANDOMIZE_BASE is turned off: RANDOMIZE_BASE is the only
+ arm64 symbol that selects RELOCATABLE, so the link becomes a normal ET_EXEC:
+ absolute kallsyms addresses, no .rela.dyn, and kptools takes exactly the path
+ it takes for the stock kernel.
+
+ Trade-offs: no KASLR, and CONFIG_ARM64_MODULE_PLTS disappears with it.  No
+ out-of-tree modules are used and the bootloader always loads the kernel at its
+ link address, so neither matters here.
+
+ Do not substitute --apply-dynamic-relocs: .rela.dyn stays in the image and
+ kptools would apply it a second time at the wrong offsets, corrupting text.
+
+ Verification shortcut used while diagnosing: rewriting every
+ R_AARCH64_RELATIVE site in the Image with its r_addend (base
+ 0xffffff8010080000) makes kptools succeed on the unmodified PIE image, which
+ confirms the mechanism.  It is a diagnostic only, not part of the build.
+
+
+7. GCC build fixes (patches/0001-gcc-build-fixes.patch)
+--------------------------------------------------------------------------------
+ The vendor tree is normally built with AOSP clang; GCC 11 rejects a few
+ constructs clang accepts.
+
+ (1) include/linux/keyslot-manager.h + block/keyslot-manager.c
+ (2) include/linux/blk-crypto.h      + block/blk-crypto.c
+     ksm_flock() and blk_crypto_flock() are declared/defined as plain "inline"
+     but live in .c files and are called from other translation units.  In this
+     kernel "inline" expands to
+     __attribute__((always_inline)) __gnu_inline (compiler_types.h), so GCC
+     refuses to call a function whose body is not visible:
+       error: inlining failed in call to 'always_inline' 'ksm_flock':
+              function body not available
+     Fix: drop "inline" from declaration and definition.  They are ordinary
+     EXPORT_SYMBOL_GPL functions.
+
+ (3) drivers/gpu/mediatek/gpu_mali/mali_valhall/mali-r32p1/drivers/gpu/arm/
+     midgard/Kbuild: add ".NOTPARALLEL:".
+     The subtree lists some objects both directly and through the composite
+     mali_kbase-y list, so a -j build can run the same .tmp_<obj> rule twice.
+     With CONFIG_MODVERSIONS that shows up as
+       ld: cannot open linker script file .../.tmp_mali_kbase_pm_always_on.ver
+     Serializing that subtree makes it deterministic.
+
+ (4) drivers/misc/mediatek/connectivity/wlan/core/gen4m/chips/common/fw_dl.c
+     Two calls of the form
+       kalStrnCpy(aucBuf, ...->ram_version, sizeof(...->ram_version));
+     trip -Werror=sizeof-pointer-memaccess.  The source is a uint8_t[10] array
+     member, not a pointer, so it is a false positive (reproducible with a
+     3-line test case).  Both destinations are zeroed with kalMemZero(aucBuf,
+     32) right before the copy, so kalStrnCpy (strncpy) is replaced with
+     kalMemCopy (memcpy): identical result, no warning.
+
+ When committing these, note that the kernel version string embeds the git
+ hash, so a new commit changes the "...-g<hash>" suffix.  That is cosmetic.
+
+
+8. Packaging and the sideload zip
+--------------------------------------------------------------------------------
+ scripts/finalize.sh
+   -> repack boot.img from output/boot-stock-lineage.img + our Image.gz
+   -> AnyKernel3 zip (kernel only)
+   -> sha256
+
+ scripts/make-bootimg-zip.sh [boot.img]
+   -> zip with META-INF/com/google/android/{update-binary,updater-script}
+      and boot.img
+
+ The update-binary in the full-image zip finds the active A/B slot
+ (ro.boot.slot_suffix, then ro.boot.slot, then /proc/cmdline), resolves
+ /dev/block/by-name/boot<slot> (with bootdevice/platform fallbacks), checks the
+ ANDROID! magic, and dd's the bundled image.
+
+ Facts about this device's recovery ramdisk, verified by unpacking the stock
+ boot.img (these drove the script design):
+
+   - LineageOS 24 on earth is recovery-as-boot: /system/bin/recovery lives in
+     this same boot ramdisk, and there is no separate recovery partition.
+   - The ramdisk contains NO /sbin at all.  AnyKernel3's update-binary starts
+     with "#!/sbin/sh", which cannot work here, so this repo's
+     anykernel3/META-INF/com/google/android/update-binary was changed to
+     "#!/system/bin/sh".  Our own update-binary uses the same shebang.
+   - Available: /system/bin/sh (mksh, dynamically linked; linker64 and libc.so
+     are in the ramdisk), toybox (dd, tr, grep, cut, wc, mkdir, rm, sync,
+     chmod), toolbox getprop, and /system/bin/unzip -> ziptool.
+   - ziptool only supports "-d DIR" style options: the script uses
+     "/system/bin/unzip -o -d $WORK $ZIPFILE boot.img".  There is no busybox.
+   - Recovery passes $1 = api version, $2 = status fd, $3 = package path and
+     execs update-binary with execv, so the shebang really matters.
+
+ anykernel3/anykernel.sh
+   kernel.string     earth 4.19.325 APatch-ready kernel (MT6768)
+   do.devicecheck=1  device.name1=earth (aether / Redmi 12C as aliases)
+   do.modules=0, do.systemless=0, do.cleanup=1
+   BLOCK=boot, IS_SLOT_DEVICE=1, RAMDISK_COMPRESSION=auto
+   PATCH_VBMETA_FLAG=0   never let magiskboot touch vbmeta/flags
+   boot_attributes       only chmods $RAMDISK/* and $RAMDISK/init*; the upstream
+                         $RAMDISK/sbin line would fail because sbin is absent
+   install: dump_boot; write_boot;   (no DTB handling, see section 3)
+
+ Ordering: the AnyKernel3 zip replaces only the kernel, so flashing it after
+ APatch erases the patch.  Correct order is stock/our boot.img -> APatch patch
+ -> flash the patched image (fastboot or the full-image zip).
+
+
+9. Flashing, recovery and rollback
+--------------------------------------------------------------------------------
+   adb reboot recovery        recovery-as-boot; boots only with a boot image
+                              that contains the recovery ramdisk (all of ours do)
+   adb reboot bootloader      fastboot
+
+   adb sideload output/earth-apatch-bootimg-<date>.zip
+   fastboot flash boot_a <image>; fastboot flash boot_b <image>; fastboot reboot
+
+ Rollback: flash boot-stock-lineage.img to boot_a and boot_b.
+
+ Never flash a "recovery.img": there is no such partition on this device.
+
+
+10. .kpm modules (optional)
+--------------------------------------------------------------------------------
+ APatch's KernelPatch provides inline (kpatch) and syscall hooks and loads them
+ as .kpm modules; the kernel needs no extra code beyond working kallsyms
+ (section 2).  KernelPatch ships demo modules (demo-inlinehook.kpm,
+ demo-syscallhook.kpm) in its releases, installable from the APatch module page.
+
+ A .kpm is compiled against the KernelPatch SDK, not against this kernel tree,
+ so it needs the KernelPatch toolchain as well.  Nothing like that is included
+ here.
+
+
+11. Checklist for a rebuild
+--------------------------------------------------------------------------------
+ [ ] docker image built                  ./build.sh image
+ [ ] config generated                    ./build.sh defconfig configs/apatch.fragment
+ [ ] grep -x CONFIG_KALLSYMS_ALL=y out/.config
+ [ ] grep -x CONFIG_DEBUG_KERNEL=y out/.config
+ [ ] no "CONFIG_RANDOMIZE_BASE=y" in out/.config
+ [ ] ./build.sh build Image.gz            -> out/arch/arm64/boot/Image.gz
+ [ ] scripts/verify-patch.sh              -> "OK: kernel is APatch/KernelPatch patchable"
+ [ ] scripts/finalize.sh                  -> output/boot.img + AnyKernel3 zip
+ [ ] scripts/make-bootimg-zip.sh output/boot.img
+ [ ] repacker self-test still byte-identical with the stock kernel
+ [ ] strings out/arch/arm64/boot/Image | grep "Linux version"   (sanity)
+ [ ] grep -ri kernelsu --include='*.c' --include='*.h' . | head  (must be empty)
+
+
+12. Pitfalls
+--------------------------------------------------------------------------------
+ - Stale out/.config: always regenerate from earth_defconfig + fragment.  A
+   stale config is how KALLSYMS_ALL (and the non-PIE requirement) gets lost.
+ - Building as root in Docker makes root-owned files; build.sh passes
+   --user $(id -u):$(id -g) and HOME=/tmp.
+ - A "-dirty" kernel version suffix only means the source tree has uncommitted
+   changes.
+ - AnyKernel3 must not ship dtb/dtbo on this device.
+ - Swapping ramdisks between LineageOS builds: the ramdisk belongs to the ROM;
+   this toolkit only replaces the kernel.
+================================================================================

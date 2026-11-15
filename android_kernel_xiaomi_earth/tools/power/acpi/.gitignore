@@ -1,0 +1,8 @@
+acpidbg
+acpidump
+ec
+include
+!tools/
+!tools/acpidbg/
+!tools/acpidump/
+!tools/ec/
