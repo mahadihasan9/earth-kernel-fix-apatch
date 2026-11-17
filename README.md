@@ -29,23 +29,57 @@ this kernel.
 
 ## Download and install (no build required)
 
-Grab these from [Releases](../../releases):
+`output/` has **three folders, two files in each** — one image and one zip with
+the same base name, so nothing is mixed:
 
-| File | What it is |
-|---|---|
-| `boot.img` | Kernel packed in the stock boot layout. **This is the file you patch with APatch.** |
-| `earth-apatch-bootimg-<date>.zip` | `adb sideload` package that writes a complete boot image to the active slot |
-| `earth-apatch-<kernelver>-<date>.zip` | AnyKernel3 package, kernel only (for a non-APatch setup) |
-| `boot-stock-lineage.img` | Untouched stock boot image — rollback |
+| Folder | Image | Zip |
+|---|---|---|
+| `main/` | `01-stock-boot.img` — untouched LineageOS image (rollback + repack template) | `01-stock-boot.zip` — sideload zip that restores it |
+| `apatch/` | `02-apatch-boot.img` — our kernel, stock layout (**this is what APatch patches**) | `02-apatch-boot.zip` — sideload zip that writes it |
+| `docker/` | `03-docker-boot.img` — Docker-enabled kernel (also APatch-patchable) | `03-docker-boot.zip` — sideload zip that writes it |
 
-For native Docker on the phone, the `docker`-named files from
-[Docker on the device](#docker-on-the-device-termux--root) are used instead;
-the standard files above stay APatch-only.
+```
+output/
+├── main/     01-stock-boot.img   01-stock-boot.zip
+├── apatch/   02-apatch-boot.img  02-apatch-boot.zip
+├── docker/   03-docker-boot.img  03-docker-boot.zip
+├── anykernel3/   optional kernel-only zips
+└── SHA256SUMS.txt
+```
+
+`SHA256SUMS.txt` has the checksums. Every line starts with the full path, so it
+is always clear which hash belongs to which file:
+
+```
+8d50dd35...  main/01-stock-boot.img
+e0cff4b5...  apatch/02-apatch-boot.img
+4d3b6f0e...  docker/03-docker-boot.img
+```
+
+Verify with:
+
+```sh
+cd output && sha256sum -c SHA256SUMS.txt
+```
+
+A file ending in `-PATCHED.img` is **your own APatch output**, not something the
+build produces: `apatch/02-apatch-boot-PATCHED.img` /
+`docker/03-docker-boot-PATCHED.img` are created when you patch the matching
+image in the APatch app.
+
+> The zip packages contain the **unpatched** image as `boot.img`. For a rooted
+> phone, patch the `.img` in APatch first, then put the patched file back into
+> the zip (same name `boot.img`) or flash it with fastboot.
+
+`output/anykernel3/` holds an optional **kernel-only** AnyKernel3 package
+(`02-apatch-...`, `03-docker-...`). It is only for a non-APatch setup: it
+replaces just the kernel, so flashing it after APatch would erase the patch.
 
 ### 1. Patch the boot image with APatch
 
-1. Copy `boot.img` to the phone.
-2. Open **APatch** → *Patch Image* → select `boot.img`.
+1. Copy the image to the phone: `apatch/02-apatch-boot.img` (normal kernel)
+   or `docker/03-docker-boot.img` (Docker kernel).
+2. Open **APatch** → *Patch Image* → select the image.
 3. APatch writes a patched image (usually to `Download/`). Keep it.
 
 Verified to work with KernelPatch **0.13.9** tools; any recent APatch that
@@ -56,17 +90,18 @@ reports a successful patch is fine.
 Fastboot (recommended, both slots):
 
 ```sh
-fastboot flash boot_a apatch-patched.img
-fastboot flash boot_b apatch-patched.img
+# run from the repo root; use docker/03-docker-boot-PATCHED.img for Docker
+fastboot flash boot_a output/apatch/02-apatch-boot-PATCHED.img
+fastboot flash boot_b output/apatch/02-apatch-boot-PATCHED.img
 fastboot reboot
 ```
 
-or recovery sideload — put the patched image into the package as `boot.img`
-(same file name), then:
+or recovery sideload — put the patched image into the matching package as
+`boot.img` (same file name), then:
 
 ```sh
 adb reboot recovery
-adb sideload earth-apatch-bootimg-<date>.zip
+adb sideload output/apatch/02-apatch-boot.zip   # or output/docker/03-docker-boot.zip
 ```
 
 The `update-binary` detects the active slot from `ro.boot.slot_suffix`
@@ -74,10 +109,19 @@ The `update-binary` detects the active slot from `ro.boot.slot_suffix`
 
 ### 3. Rollback
 
+Fastboot:
+
 ```sh
-fastboot flash boot_a boot-stock-lineage.img
-fastboot flash boot_b boot-stock-lineage.img
+fastboot flash boot_a output/main/01-stock-boot.img
+fastboot flash boot_b output/main/01-stock-boot.img
 fastboot reboot
+```
+
+or from recovery:
+
+```sh
+adb reboot recovery
+adb sideload output/main/01-stock-boot.zip
 ```
 
 > **Never flash a file called `recovery.img`.** This device boots recovery from
@@ -89,24 +133,22 @@ fastboot reboot
 
 ### Publishing a release (maintainer)
 
-After `scripts/finalize.sh` and `scripts/make-bootimg-zip.sh`, attach these to
-a GitHub release:
+After `scripts/finalize.sh` and `scripts/build-docker-variant.sh`, attach every
+numbered file plus the checksum file to a GitHub release:
 
 ```
-output/boot.img
-output/earth-apatch-bootimg-<date>.zip
-output/earth-apatch-<kernelver>-<date>.zip
-output/boot-stock-lineage.img
-output/sha256sums.txt
+output/main/01-stock-boot.img
+output/main/01-stock-boot.zip
+output/apatch/02-apatch-boot.img
+output/apatch/02-apatch-boot.zip
+output/docker/03-docker-boot.img
+output/docker/03-docker-boot.zip
+output/SHA256SUMS.txt
 ```
 
-with
-
-```sh
-sha256sum output/*.img output/*.zip > output/sha256sums.txt
-```
-
-Suggested tag: the kernel version, e.g. `v4.19.325-cip136-st20`.
+`scripts/checksums.sh` regenerates `SHA256SUMS.txt` for whatever is present.
+The optional kernel-only packages live in `output/anykernel3/` and can be
+attached too. Suggested tag: the kernel version, e.g. `v4.19.325-cip136-st20`.
 
 ---
 
@@ -176,8 +218,8 @@ No separate clone, checkout or patch step is needed.
 git clone <this-repo-url> earth-kernel-abuild
 cd earth-kernel-abuild
 
-# 2. stock boot image used as the repack template
-cp /path/to/stock/boot.img output/boot-stock-lineage.img
+# 2. stock boot image (also the 01-stock rollback file)
+cp /path/to/stock/boot.img output/main/01-stock-boot.img
 
 # 3. build the Docker image once
 ./build.sh image
@@ -189,9 +231,8 @@ cp /path/to/stock/boot.img output/boot-stock-lineage.img
 # 5. verify APatch compatibility (requires kptools, see tools/README.md)
 scripts/verify-patch.sh
 
-# 6. package
-scripts/finalize.sh                          # output/boot.img + AnyKernel3 zip
-scripts/make-bootimg-zip.sh output/boot.img  # full-image sideload zip
+# 6. package: 01-stock + 02-apatch img/zip, AnyKernel3, SHA256SUMS.txt
+scripts/finalize.sh
 ```
 
 `scripts/full-build.sh` runs steps 3-5 in one go.
@@ -204,24 +245,25 @@ also builds the Docker image.
 
 ### Stock template
 
-`output/boot.img` is produced by swapping only the kernel inside a known-good
+`apatch/02-apatch-boot.img` is produced by swapping only the kernel inside a known-good
 boot image, so a stock `boot.img` for the exact ROM version is required as
-`output/boot-stock-lineage.img`. It is not shipped in git (`output/` is
-ignored), because the ramdisk belongs to the ROM.
+`output/main/01-stock-boot.img`. It is not shipped in git (`output/` is ignored),
+because the ramdisk belongs to the ROM. The same file is the `01-stock` rollback
+image, which is why it carries the first number.
 
 Get it from the LineageOS install package with
 [payload-dumper-go](https://github.com/ssut/payload-dumper-go):
 
 ```sh
 payload-dumper-go -p boot -o extracted lineage-24.0-*-earth.zip
-cp extracted/boot.img output/boot-stock-lineage.img
+cp extracted/boot.img output/main/01-stock-boot.img
 ```
 
 or dump it from the device (root shell, before flashing anything):
 
 ```sh
 adb shell su -c 'dd if=/dev/block/by-name/boot_a of=/sdcard/stock-boot.img'
-adb pull /sdcard/stock-boot.img output/boot-stock-lineage.img
+adb pull /sdcard/stock-boot.img output/main/01-stock-boot.img
 ```
 
 Reusing a boot image from a different LineageOS build is not supported: the
@@ -249,19 +291,19 @@ build the second variant — same sources and toolchain, plus
 scripts/build-docker-variant.sh
 ```
 
-It builds into `out-docker/` and produces distinctly named files, so the
-normal build is never touched:
+It builds into `out-docker/` and produces the `03-docker` group, so the normal
+build is never touched:
 
 | File | What it is |
 |---|---|
-| `output/boot-docker.img` | Docker-enabled kernel in the stock boot layout |
-| `output/earth-apatch-docker-<ver>-<stamp>.zip` | AnyKernel3, kernel only |
-| `output/earth-apatch-docker-bootimg-<stamp>.zip` | full-image sideload zip |
+| `output/docker/03-docker-boot.img` | Docker-enabled kernel in the stock boot layout |
+| `output/docker/03-docker-boot.zip` | sideload zip that writes `03-docker-boot.img` |
+| `output/anykernel3/03-docker-anykernel3-<stamp>.zip` | optional kernel-only package |
 
-`output/sha256sums-docker.txt` holds their checksums. `SKIP_BUILD=1` repacks
+`output/SHA256SUMS.txt` is regenerated after packaging. `SKIP_BUILD=1` repacks
 an existing build, and `TEMPLATE=/path/to/stock.img` points at a different
-stock boot image. Patch `boot-docker.img` with APatch exactly like the normal
-image.
+stock boot image. Patch `docker/03-docker-boot.img` with APatch exactly like
+`apatch/02-apatch-boot.img`.
 
 The fragment enables namespaces, the cgroup controllers, overlayfs,
 veth/bridge, VXLAN/MACVLAN/IPVLAN and the iptables NAT targets that dockerd
@@ -270,20 +312,20 @@ needs. It does not enable IPVS (absent from this tree) or the hugetlb cgroup
 
 ## Docker on the device (Termux + root)
 
-With `boot-docker.img` flashed, the phone runs a **real `dockerd`** — no proot,
+With `docker/03-docker-boot.img` flashed, the phone runs a **real `dockerd`** — no proot,
 no chroot, no PC. `scripts/termux-dockerd.sh` is the helper: it downloads the
 static Docker binaries, starts/stops the daemon with a persistent data root,
 and hands the normal `build.sh` a working `DOCKER_HOST`.
 
 ```
-APatch-patched boot-docker.img  ->  dockerd (root, Termux)  ->  docker run / ./build.sh
+APatch-patched docker/03-docker-boot.img  ->  dockerd (root, Termux)  ->  docker run / ./build.sh
 ```
 
 ### Prerequisites
 
 | | |
 |---|---|
-| Kernel | Docker-enabled variant (`output/boot-docker.img`) on **both** slots |
+| Kernel | Docker-enabled variant (`output/docker/03-docker-boot.img`) on **both** slots |
 | Root | APatch (or another root) with a working `su` |
 | Termux | `pkg install curl tar` — `pkg install iproute2` for the `doctor` probes |
 | Space | ~10 GB free on `/data` (Docker binaries ~70 MB + images + build tree) |
@@ -291,7 +333,7 @@ APatch-patched boot-docker.img  ->  dockerd (root, Termux)  ->  docker run / ./b
 
 The standard `boot.img` does **not** have the container options. If
 `/proc/config.gz` shows `CONFIG_NAMESPACES` or `CONFIG_VETH` missing, the wrong
-kernel is running — flash `boot-docker.img` first.
+kernel is running — flash `docker/03-docker-boot.img` first.
 
 ### Quick start
 
@@ -310,7 +352,7 @@ works even when container NAT is unavailable.
 
 ### 1. Flash the Docker kernel
 
-Patch `output/boot-docker.img` with APatch exactly like the normal image, then
+Patch `output/docker/03-docker-boot.img` with APatch exactly like the normal image, then
 flash the **patched** file to both slots (same rules as
 [Download and install](#download-and-install-no-build-required)):
 
@@ -320,7 +362,7 @@ fastboot flash boot_b apatch-patched-docker.img
 fastboot reboot
 ```
 
-Rollback is always the untouched `output/boot-stock-lineage.img`.
+Rollback is always the untouched `output/main/01-stock-boot.img`.
 
 ### 2. Set up Termux
 
@@ -472,7 +514,7 @@ deleted automatically — to start clean, remove `~/.local/share/docker-data`
 | `-p` port not reachable | same reason — use `--network host` and connect to the container port |
 | `no space left on device` | `docker system prune -af`, and remember `vfs` copies every layer in full |
 | build killed (OOM) | rerun with `-e JOBS=4` as shown above |
-| `doctor` reports missing `CONFIG_*` | the standard kernel is running; flash the APatch-patched `boot-docker.img` |
+| `doctor` reports missing `CONFIG_*` | the standard kernel is running; flash the APatch-patched `docker/03-docker-boot.img` |
 
 Kernel-side details and the full option list are in `NOTES.txt` section 13.
 `DOCKER_VERSION`, `DOCKER_STORAGE`, `DOCKER_DATA_ROOT`, `DOCKER_LOG`, `IMAGE`
@@ -480,7 +522,7 @@ can be overridden as environment variables.
 
 ### GitHub Actions
 
-`.github/workflows/build.yaml` builds **both variants automatically** in the
+`.github/workflows/build.yml` builds **both variants automatically** in the
 same Docker pipeline:
 
 | Job | Config | Build tree | Artifact |
@@ -497,12 +539,12 @@ same Docker pipeline:
 - caches the Docker layers and the build trees, so a rerun continues instead
   of starting over — `clean_build` forces a fresh one;
 - uploads `Image.gz`, `Image`, `kernel.config`, `kernel.release`, whatever
-  boot images/zips were produced, and `sha256sums.txt`.
+  boot images/zips were produced, and a single `SHA256SUMS.txt`.
 
 `boot.img` needs the stock boot template, which is not in the repository. Set
 the repository variable `STOCK_BOOT_URL` (Settings → Secrets and variables →
 Actions → Variables) or pass `stock_boot_url` on a manual run, and CI will
-download it and build `boot.img`, `boot-docker.img` and the sideload zips too.
+download it and build the `02-apatch` and `03-docker` images plus all sideload zips.
 Without it you only get `Image.gz`/`Image` and the AnyKernel3 zip.
 
 ### Source changes
@@ -543,17 +585,23 @@ configs/apatch.fragment      APatch-required kernel config
 configs/docker.fragment      optional Docker/containerd options (variant)
 patches/0001-gcc-build-fixes.patch  same fixes, for upstream users
 scripts/repack-boot.py       boot image v2 repacker (kernel swap only)
-scripts/make-zip.sh          AnyKernel3 kernel-only zip
+scripts/make-zip.sh          AnyKernel3 kernel-only zip -> output/anykernel3/
 scripts/make-bootimg-zip.sh  full boot image sideload zip
-scripts/finalize.sh          repack + zip + sha256
-scripts/build-docker-variant.sh  Docker-enabled variant (out-docker/)
+scripts/finalize.sh          02-apatch img/zip + 01-stock zip + checksums
+scripts/build-docker-variant.sh  Docker-enabled variant (03-docker, out-docker/)
+scripts/checksums.sh         regenerate output/SHA256SUMS.txt
 scripts/termux-dockerd.sh    native dockerd on the phone (Termux + root)
 scripts/verify-patch.sh      KernelPatch patchability gate
 scripts/full-build.sh        image + defconfig + build + verify
-.github/workflows/build.yaml  CI: both variants, cached (Docker)
+.github/workflows/build.yml  CI: both variants, cached (Docker)
 anykernel3/                  AnyKernel3 (osm0sis) with an earth config
 tools/                       place kptools-linux / kpimg-linux here
-output/                      build artifacts (git-ignored)
+output/                      deliverables (git-ignored):
+  main/01-stock-boot.img/.zip   stock image + rollback zip
+  apatch/02-apatch-boot.img/.zip  standard kernel + sideload zip
+  docker/03-docker-boot.img/.zip  Docker kernel + sideload zip
+  anykernel3/                optional kernel-only zips
+  SHA256SUMS.txt             one checksum file, full paths on every line
 out/                         kernel build tree (git-ignored)
 out-docker/                  Docker variant build tree (git-ignored)
 ```
@@ -606,7 +654,7 @@ byte-for-byte, which is used as a self-test for the script.
 | APatch: `find approximate kallsyms_addresses error` | kernel is PIE — `CONFIG_RANDOMIZE_BASE` must be off (see above) |
 | `kptools` not found | download it into `tools/`, see `tools/README.md` |
 | Sideload fails to run `update-binary` | the script uses `#!/system/bin/sh` on purpose; this recovery ramdisk has no `/sbin` |
-| Device does not boot after flashing | flash `boot-stock-lineage.img` to both slots |
+| Device does not boot after flashing | flash `main/01-stock-boot.img` to both slots |
 
 ## Credits and license
 

@@ -4,10 +4,11 @@
 # Usage:
 #   scripts/make-bootimg-zip.sh [boot.img] [output-name.zip]
 #
-# With no boot.img argument, output/boot.img is used.  This is the package to
-# use after APatch has patched the boot image: put the APatch-patched file in
-# the zip as "boot.img" (same name), or flash output/boot.img as-is to get a
-# clean, unpatched boot with our kernel.
+# With no boot.img argument, output/apatch/02-apatch-boot.img is used and the
+# zip is named output/apatch/02-apatch-boot.zip.  The zip always contains the image as
+# "boot.img".  This is the package to use after APatch has patched an image:
+# replace boot.img inside the zip with the APatch-patched file (same name), or
+# flash the unpatched image as-is to get a clean boot with our kernel.
 #
 # AnyKernel3 is not involved here: the whole boot partition (kernel + the
 # stock LineageOS ramdisk) is written verbatim.
@@ -21,9 +22,16 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-BOOT="${1:-$ROOT/output/boot.img}"
+BOOT="${1:-$ROOT/output/apatch/02-apatch-boot.img}"
 STAMP="$(date +%Y%m%d-%H%M)"
-ZIP="${2:-$ROOT/output/earth-apatch-bootimg-${STAMP}.zip}"
+ZIP="${2:-$ROOT/output/apatch/02-apatch-boot.zip}"
+
+# The zip command runs inside $WORK, so the destination must be absolute.
+case "$ZIP" in
+    /*) ;;
+    *)  ZIP="$PWD/$ZIP" ;;
+esac
+mkdir -p "$(dirname "$ZIP")"
 
 [[ -f "$BOOT" ]] || { echo "no such boot image: $BOOT" >&2; exit 1; }
 

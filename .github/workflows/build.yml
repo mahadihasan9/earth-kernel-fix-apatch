@@ -213,12 +213,12 @@ jobs:
         run: |
           set -eux
           if [ -z "${STOCK_BOOT_URL:-}" ]; then
-            echo "no STOCK_BOOT_URL set: boot.img will not be built in CI"
+            echo "no STOCK_BOOT_URL set: boot images will not be built in CI"
             exit 0
           fi
-          mkdir -p output
-          curl -fL --retry 3 --retry-delay 5 -o output/boot-stock-lineage.img "$STOCK_BOOT_URL"
-          ls -l output/boot-stock-lineage.img
+          mkdir -p output/main
+          curl -fL --retry 3 --retry-delay 5 -o output/main/01-stock-boot.img "$STOCK_BOOT_URL"
+          ls -l output/main/01-stock-boot.img
 
       - name: Package
         env:
@@ -228,20 +228,18 @@ jobs:
           set -eux
           command -v zip >/dev/null || sudo apt-get install -y zip
           if [ ! -f "$OUT_DIR/arch/arm64/boot/Image.gz" ]; then
-            echo "target is not Image.gz, skipping boot.img and zip packaging"
+            echo "target is not Image.gz, skipping boot image and zip packaging"
             exit 0
           fi
           if [ "$VARIANT" = "docker" ]; then
-            # Handles a missing template by skipping boot-docker.img and still
-            # producing the AnyKernel3 zip.
+            # Produces 03-docker-boot.img + 03-docker-boot.zip when the stock
+            # template is present, and the kernel-only zip either way.
             SKIP_BUILD=1 scripts/build-docker-variant.sh
-          elif [ -f output/boot-stock-lineage.img ]; then
-            # finalize.sh/make-zip.sh use out/ and output/, which is exactly
-            # this matrix entry (name: standard, out: out).
+          elif [ -f output/main/01-stock-boot.img ]; then
+            # Produces 02-apatch-boot.img + the 01-stock and 02-apatch zips.
             scripts/finalize.sh
-            scripts/make-bootimg-zip.sh output/boot.img
           else
-            scripts/make-zip.sh
+            PREFIX=02-apatch scripts/make-zip.sh
           fi
 
       - name: Collect artifacts and checksums
@@ -262,13 +260,12 @@ jobs:
               cp "$f" "release/$name"
             fi
           done
-          for f in output/*.zip output/*.img; do
+          for f in output/main/* output/apatch/* output/docker/* output/anykernel3/*.zip; do
             if [ ! -f "$f" ]; then continue; fi
-            name="$(basename "$f")"
-            if [ "$name" = "boot-stock-lineage.img" ]; then continue; fi
-            cp "$f" "release/$name"
+            cp "$f" "release/$(basename "$f")"
           done
-          ( cd release && sha256sum ./* > sha256sums.txt && cat sha256sums.txt )
+          # one self-describing checksum file for the whole artifact set
+          ( cd release && rm -f SHA256SUMS.txt && sha256sum ./* > SHA256SUMS.txt && cat SHA256SUMS.txt )
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
@@ -300,9 +297,9 @@ jobs:
             echo "- target: \`$TARGET\`"
             echo "- build tree: \`$OUT_DIR\`"
             echo "- build tree cache: \`${{ steps.kbuild-cache.outputs.cache-hit == 'true' && 'hit (exact)' || 'restored previous / empty' }}\`"
-            echo "- stock boot template: \`$([ -f output/boot-stock-lineage.img ] && echo yes || echo no)\`"
+            echo "- stock boot template: \`$([ -f output/main/01-stock-boot.img ] && echo yes || echo no)\`"
             echo
             echo '```'
-            cat release/sha256sums.txt 2>/dev/null || echo "artifacts were not produced"
+            cat release/SHA256SUMS.txt 2>/dev/null || echo "artifacts were not produced"
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"

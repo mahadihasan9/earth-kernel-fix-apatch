@@ -15,12 +15,12 @@
  does not re-sign AVB.
 
  Two kernel variants can be produced from the same source (section 13):
-   standard       configs/apatch.fragment                  -> out/,  output/boot.img
+   standard       configs/apatch.fragment                  -> out/,  output/apatch/02-apatch-boot.img
    docker         + configs/docker.fragment                -> out-docker/,
-                  output/boot-docker.img  (native dockerd on the device)
+                  output/docker/03-docker-boot.img  (native dockerd on the device)
  The standard image deliberately stays without the container options.
 
- CI: .github/workflows/build.yaml builds both variants in Docker (section 14).
+ CI: .github/workflows/build.yml builds both variants in Docker (section 14).
 
 
 2. Kernel config that matters
@@ -98,7 +98,7 @@
  layout.
 
  Self-test: repacking the stock image with the stock kernel must reproduce
- boot-stock-lineage.img byte-for-byte.  Any change to the repacker has to keep
+ main/01-stock-boot.img byte-for-byte.  Any change to the repacker has to keep
  that property.
 
 
@@ -119,14 +119,14 @@
 
  Patching the finished boot.img directly also works:
 
-   kptools -p -i output/boot.img -k kpimg-linux -o /tmp/boot-patched.img
+   kptools -p -i output/apatch/02-apatch-boot.img -k kpimg-linux -o /tmp/boot-patched.img
    -> "Preserved original AVB metadata ..." / "Repack completed"
 
  and leaves the ramdisk and DTB untouched while the kernel grows by the kpimg
  payload (~76 KB).
 
  Real-world confirmation: a boot image patched with the APatch app (0.13.9)
- from output/boot.img keeps the ramdisk and DTB byte-for-byte, grows the kernel
+ from output/apatch/02-apatch-boot.img keeps the ramdisk and DTB byte-for-byte, grows the kernel
  by ~99 KB, and the decompressed kernel contains the "KernelPatch" marker while
  still reporting "Linux version 4.19.325-cip136-st20-gd71f5e81f6e7".
 
@@ -219,13 +219,21 @@
 8. Packaging and the sideload zip
 --------------------------------------------------------------------------------
  scripts/finalize.sh
-   -> repack boot.img from output/boot-stock-lineage.img + our Image.gz
-   -> AnyKernel3 zip (kernel only)
-   -> sha256
+   -> repack output/apatch/02-apatch-boot.img from
+      output/main/01-stock-boot.img + Image.gz
+   -> output/apatch/02-apatch-boot.zip (sideload zip, full boot image inside)
+   -> output/main/01-stock-boot.zip    (same zip built from the stock template)
+   -> output/anykernel3/02-apatch-anykernel3-<stamp>.zip (kernel only, optional)
+   -> scripts/checksums.sh             -> output/SHA256SUMS.txt
 
- scripts/make-bootimg-zip.sh [boot.img]
+ scripts/make-bootimg-zip.sh [boot.img] [output.zip]
    -> zip with META-INF/com/google/android/{update-binary,updater-script}
-      and boot.img
+      and boot.img (the enclosed file is always named boot.img)
+
+ Output layout: output/main/ (01-stock), output/apatch/ (02-apatch) and
+ output/docker/ (03-docker); each folder is one image plus one zip with the
+ same base name.  Checksums go to a single SHA256SUMS.txt, and every line
+ carries the full path.
 
  The update-binary in the full-image zip finds the active A/B slot
  (ro.boot.slot_suffix, then ro.boot.slot, then /proc/cmdline), resolves
@@ -270,10 +278,12 @@
                               that contains the recovery ramdisk (all of ours do)
    adb reboot bootloader      fastboot
 
-   adb sideload output/earth-apatch-bootimg-<date>.zip
+   adb sideload output/apatch/02-apatch-boot.zip
+                              (or output/docker/03-docker-boot.zip)
    fastboot flash boot_a <image>; fastboot flash boot_b <image>; fastboot reboot
 
- Rollback: flash boot-stock-lineage.img to boot_a and boot_b.
+ Rollback: flash output/main/01-stock-boot.img to boot_a and boot_b, or
+ sideload output/main/01-stock-boot.zip.
 
  Never flash a "recovery.img": there is no such partition on this device.
 
@@ -299,10 +309,10 @@
  [ ] no "CONFIG_RANDOMIZE_BASE=y" in out/.config
  [ ] ./build.sh build Image.gz            -> out/arch/arm64/boot/Image.gz
  [ ] scripts/verify-patch.sh              -> "OK: kernel is APatch/KernelPatch patchable"
- [ ] scripts/finalize.sh                  -> output/boot.img + AnyKernel3 zip
- [ ] scripts/make-bootimg-zip.sh output/boot.img
+ [ ] scripts/finalize.sh                  -> main/ + apatch/ img+zip + SHA256SUMS.txt
+ [ ] output/SHA256SUMS.txt lists every delivered file by name
  [ ] (docker variant) OUT=out-docker ./build.sh defconfig configs/apatch.fragment configs/docker.fragment
- [ ] (docker variant) scripts/build-docker-variant.sh   -> output/boot-docker.img + docker zips
+ [ ] (docker variant) scripts/build-docker-variant.sh   -> output/docker/ img+zip
  [ ] (on the phone)   scripts/termux-dockerd.sh doctor    -> all kernel features ok
  [ ] (on the phone)   scripts/termux-dockerd.sh start     -> docker info works
  [ ] repacker self-test still byte-identical with the stock kernel
@@ -330,7 +340,7 @@
  namespaces, most cgroup controllers, overlayfs upperdirs, and veth/bridge with
  iptables NAT.  Putting those into the normal kernel would grow the attack
  surface for everyone, so they live in their own fragment and their own boot
- image.  The standard image in output/boot.img does NOT get them.
+ image.  The standard image in output/apatch/02-apatch-boot.img does NOT get them.
 
  Files
    configs/docker.fragment          48 "=y" options: namespaces, cgroup
@@ -339,7 +349,7 @@
                                     keys, seccomp, netlink diag
    scripts/build-docker-variant.sh  configure + build + repack + zip for the
                                     variant; writes only to out-docker/ and to
-                                    docker-named files in output/
+                                    the files in output/docker/
 
  Build
    scripts/build-docker-variant.sh                       full run
@@ -349,11 +359,11 @@
    OUT=out-docker ./build.sh defconfig configs/apatch.fragment configs/docker.fragment
    OUT=out-docker ./build.sh build Image.gz
 
- Outputs (distinct names, nothing overwritten)
-   output/boot-docker.img
-   output/earth-apatch-docker-<krel>-<stamp>.zip        AnyKernel3, kernel only
-   output/earth-apatch-docker-bootimg-<stamp>.zip       full-image sideload zip
-   output/sha256sums-docker.txt                         checksums of the three
+ Outputs (the docker/ folder, nothing overwritten)
+   output/docker/03-docker-boot.img                     boot image (APatch-patchable)
+   output/docker/03-docker-boot.zip                     sideload zip (full image)
+   output/anykernel3/03-docker-anykernel3-<stamp>.zip   kernel only (optional)
+   output/SHA256SUMS.txt                                regenerated for all files
  out-docker/ is the variant build tree and is gitignored.  Deleting it only
  throws away the variant's incremental state; out/ and the release files of the
  normal kernel are untouched.
@@ -372,10 +382,10 @@
    scripts/verify-patch.sh out-docker/arch/arm64/boot/Image tools/kptools-linux
      -> OK: kernel is APatch/KernelPatch patchable (kptools 0.13.9 / kpimg d09)
    sha256
-     4d3b6f0e38cb3a059cd92683c8edd99e06b132ca161d8f5f1ecbbafb21046831  boot-docker.img
-     bda73f06fe316e3c7410ba92bbf598c3c5753fdc5ce6992d372fa6b3f182464e  earth-apatch-docker-4.19.325-cip136-st20-20261117-2236.zip
-     586615491c65be972d4e36e5f51bd6f19d232bd345e03f12fed978aee086b416  earth-apatch-docker-bootimg-20261117-2236.zip
-   output/boot.img and the standard zips were byte-for-byte untouched
+     4d3b6f0e38cb3a059cd92683c8edd99e06b132ca161d8f5f1ecbbafb21046831  docker/03-docker-boot.img
+     (the .zip hashes change with every repack; output/SHA256SUMS.txt is
+      authoritative and lists each file by name)
+   output/apatch/02-apatch-boot.img and the standard zips were byte-for-byte untouched
    (mtime still 2026-11-15, sha256 e0cff4b5... unchanged)
 
  Deliberately not set
@@ -383,9 +393,9 @@
    CONFIG_IP_VS*                    no IPVS code in this tree at all
    CONFIG_ANDROID_PARANOID_NETWORK  symbol does not exist in this tree
 
- APatch ordering is unchanged: patch output/boot-docker.img with APatch, then
- flash the patched image (fastboot, or put it into the docker bootimg zip as
- boot.img).  Both fragments are merged, so the Docker image keeps the
+ APatch ordering is unchanged: patch output/docker/03-docker-boot.img with
+ APatch, then flash the patched image (fastboot, or put it into
+ output/docker/03-docker-boot.zip as boot.img).  Both fragments are merged, so the Docker image keeps the
  kallsyms/non-PIE requirements.
 
  Runtime notes (kernel side only; not verified on the device)
@@ -422,9 +432,9 @@
    Low-RAM phones: build.sh uses -j$(nproc); the README shows the explicit
    `docker run ... -e JOBS=4` fallback.
 
-14. GitHub Actions workflow (build.yaml)
+14. GitHub Actions workflow (build.yml)
 --------------------------------------------------------------------------------
- .github/workflows/build.yaml (the only workflow file) builds both kernel
+ .github/workflows/build.yml (the only workflow file) builds both kernel
  variants in the same Docker image used locally.  It only calls build.sh,
  scripts/finalize.sh, scripts/make-zip.sh and scripts/build-docker-variant.sh,
  so there is no second copy of the build logic to keep in sync.
@@ -444,15 +454,15 @@
    - the workflow_dispatch input stock_boot_url, or
    - the repository variable STOCK_BOOT_URL
      (Settings -> Secrets and variables -> Actions -> Variables)
- When one of them is set, the file is downloaded to
- output/boot-stock-lineage.img and the normal packaging path runs:
-   standard -> scripts/finalize.sh + scripts/make-bootimg-zip.sh
-               (boot.img, AnyKernel3 zip, full-image sideload zip)
+ When one of them is set, the file is downloaded to output/main/01-stock-boot.img
+ and the normal packaging path runs:
+   standard -> scripts/finalize.sh
+               (apatch/02-apatch-boot.img + main/ + apatch/ zips + AK3 + SHA)
    docker   -> SKIP_BUILD=1 scripts/build-docker-variant.sh
-               (boot-docker.img, docker AnyKernel3 zip, docker bootimg zip)
- Without it, the standard job still produces the AnyKernel3 zip via
- make-zip.sh, and the docker variant does the same (its script skips
- boot-docker.img and prints a warning).
+               (docker/03-docker-boot.img + docker/03-docker-boot.zip + AK3 + SHA)
+ Without it, each job still produces its kernel-only zip via make-zip.sh
+ (PREFIX=02-apatch / 03-docker) into output/anykernel3/, and the docker script
+ skips docker/03-docker-boot.img with a warning.
 
  Persistence ("volume" behaviour), on by default, nothing destructive
    - docker/build-push-action GHA cache for the 800 MB toolchain image
@@ -465,15 +475,16 @@
    - clean_build=true skips restore/save for a from-scratch build
 
  Artifacts (earth-kernel-<variant>-<run>-<attempt>, kept 30 days)
-   Image.gz, Image, kernel.config, kernel.release, whatever boot image / zips
-   the packaging step produced, and sha256sums.txt.
+   Image.gz, Image, kernel.config, kernel.release, the numbered img/zip files
+   produced by packaging, and a single SHA256SUMS.txt listing every file by
+   name.
 
  Notes
    - both jobs share the toolchain image cache but not the kernel objects, so
      the first cold run takes roughly 40-60 minutes per variant
    - every push to master/main builds both variants; warm caches make repeat
      builds incremental (usually a few minutes)
-   - build.yml (the earlier single-job version) was replaced by build.yaml;
+   - the older single-job workflow was replaced by this matrix build.yml;
      keep exactly one workflow file so a tag push does not build twice
 
  Validation done while writing it: YAML parses, all 18 steps pass bash -n, the

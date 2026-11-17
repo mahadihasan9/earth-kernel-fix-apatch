@@ -9,14 +9,15 @@
 #
 # Everything is kept apart from the normal build:
 #
-#   out-docker/                                       variant build tree
-#   output/boot-docker.img                            variant boot image
-#   output/earth-apatch-docker-<ver>-<stamp>.zip      AnyKernel3 (kernel only)
-#   output/earth-apatch-docker-bootimg-<stamp>.zip    full-image sideload zip
+#   out-docker/                                  variant build tree
+#   output/docker/03-docker-boot.img             variant boot image
+#   output/docker/03-docker-boot.zip             sideload zip (full image)
+#   output/anykernel3/03-docker-anykernel3-<stamp>.zip   kernel-only (optional)
+#   output/SHA256SUMS.txt                        regenerated for all files
 #
-# so out/, output/boot.img and the release files of the normal kernel are
-# never modified.  Removing out-docker/ only discards the variant's build
-# cache; it does not touch the main build.
+# so out/, output/apatch/02-apatch-boot.img and the other normal files are never
+# modified.  Removing out-docker/ only discards the variant's build cache; it
+# does not touch the main build.
 #
 # Usage:
 #   scripts/build-docker-variant.sh                    configure + build + package
@@ -28,9 +29,8 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 OUT_DIR="$ROOT/out-docker"
 TARGET="${TARGET:-Image.gz}"
-TEMPLATE="${TEMPLATE:-$ROOT/output/boot-stock-lineage.img}"
+TEMPLATE="${TEMPLATE:-$ROOT/output/main/01-stock-boot.img}"
 IMG="$OUT_DIR/arch/arm64/boot/${TARGET}"
-STAMP="$(date +%Y%m%d-%H%M)"
 
 log() { printf '\n\033[1;32m[docker-variant]\033[0m %s\n' "$*"; }
 die() { echo "[docker-variant] $*" >&2; exit 1; }
@@ -82,9 +82,9 @@ log "config OK: Docker options on, APatch patchability intact"
 # 3. boot image + zips
 # ---------------------------------------------------------------------------
 KREL="$(cat "$OUT_DIR/include/config/kernel.release" 2>/dev/null || echo unknown)"
-mkdir -p "$ROOT/output"
+mkdir -p "$ROOT/output/docker"
 
-BOOT="$ROOT/output/boot-docker.img"
+BOOT="$ROOT/output/docker/03-docker-boot.img"
 if [[ -f "$TEMPLATE" ]]; then
 	log "repack $BOOT from $(basename "$TEMPLATE")"
 	python3 "$ROOT/scripts/repack-boot.py" \
@@ -95,7 +95,7 @@ else
 	cat >&2 <<EOF
 
 [docker-variant] stock boot image not found: $TEMPLATE
-  boot-docker.img and the full-image sideload zip are skipped.
+  output/docker/03-docker-boot.img and .zip are skipped.
   Extract boot.img from the LineageOS package (payload-dumper-go) or dump
   boot_a from the device, then rerun with:
     TEMPLATE=/path/to/stock-boot.img scripts/build-docker-variant.sh
@@ -104,21 +104,16 @@ EOF
 	BOOT=""
 fi
 
-# AnyKernel3: kernel only, distinct file name so it can never be confused
-# with the normal release zip.
-AK="$ROOT/anykernel3"
-ZIP="$ROOT/output/earth-apatch-docker-${KREL}-${STAMP}.zip"
-log "pack AnyKernel3 zip $(basename "$ZIP")"
-rm -f "$AK"/Image "$AK"/Image.gz "$AK"/Image.gz-dtb "$AK"/dtb "$AK"/dtbo.img
-cp -f "$IMG" "$AK/Image.gz"
-rm -f "$ZIP"
-( cd "$AK" && zip -r9 "$ZIP" . -x '*.git*' >/dev/null )
+# AnyKernel3 (kernel only) goes to output/anykernel3/ so it never mixes with
+# the simple image + zip set in output/.
+log "pack AnyKernel3 zip"
+PREFIX=03-docker bash "$ROOT/scripts/make-zip.sh"
 
 if [[ -n "$BOOT" ]]; then
 	log "pack full-image sideload zip"
 	bash "$ROOT/scripts/make-bootimg-zip.sh" \
 		"$BOOT" \
-		"$ROOT/output/earth-apatch-docker-bootimg-${STAMP}.zip"
+		"$ROOT/output/docker/03-docker-boot.zip"
 fi
 
 # ---------------------------------------------------------------------------
@@ -129,17 +124,14 @@ log "done"
 	echo
 	echo "kernel release : $KREL"
 	echo "build tree     : out-docker/"
-	[[ -n "$BOOT" ]] && echo "boot image     : ${BOOT#$ROOT/}"
-	echo "AnyKernel3 zip : ${ZIP#$ROOT/}"
+	[[ -n "$BOOT" ]] && echo "boot image     : ${BOOT#$ROOT/}  (patch this with APatch)"
+	[[ -n "$BOOT" ]] && echo "sideload zip   : output/docker/03-docker-boot.zip"
+	echo "kernel-only zip: output/anykernel3/ (optional, non-APatch)"
 	echo
-	echo "APatch order: patch boot-docker.img in APatch, then flash the patched"
-	echo "image (fastboot) or put it into the full-image sideload zip as boot.img."
+	echo "APatch order: patch output/docker/03-docker-boot.img in APatch, then flash the patched"
+	echo "image (fastboot) or put it into output/docker/03-docker-boot.zip as boot.img."
 	echo "Do not flash the AnyKernel3 zip after patching with APatch."
 	echo
 } >&2
 
-FILES=("$ZIP")
-[[ -n "$BOOT" ]] && FILES+=("$BOOT")
-BOOTZIP="$ROOT/output/earth-apatch-docker-bootimg-${STAMP}.zip"
-[[ -f "$BOOTZIP" ]] && FILES+=("$BOOTZIP")
-sha256sum "${FILES[@]}" | sed "s#$ROOT/##" | tee "$ROOT/output/sha256sums-docker.txt"
+bash "$ROOT/scripts/checksums.sh"

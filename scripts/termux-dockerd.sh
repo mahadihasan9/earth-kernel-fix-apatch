@@ -2,7 +2,7 @@
 # Native Docker daemon on Android — Termux + root, no proot, no chroot.
 #
 # This is the host-side helper for the Docker-enabled kernel variant
-# (output/boot-docker.img).  It does not change build.sh: it only downloads a
+# (output/docker/03-docker-boot.img).  It does not change build.sh: it only downloads a
 # static Docker toolchain, starts/stops dockerd with a persistent data root,
 # and then hands ./build.sh a working DOCKER_HOST.
 #
@@ -107,7 +107,7 @@ doctor() {
 
 	if [[ -n "$cfg" ]]; then
 		say "kernel config from /proc/config.gz"
-		check_kernel_config "$cfg" || warn "the running kernel is not the Docker variant; flash output/boot-docker.img"
+		check_kernel_config "$cfg" || warn "the running kernel is not the Docker variant; flash output/docker/03-docker-boot.img"
 	else
 		warn "no /proc/config.gz, checking runtime features instead"
 		for ns in net pid ipc uts user; do
