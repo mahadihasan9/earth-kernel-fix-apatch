@@ -1,0 +1,308 @@
+# GitHub Actions: build both kernel variants in the project's Docker image.
+#
+#   standard -> configs/apatch.fragment              -> out/         (no Docker)
+#   docker   -> + configs/docker.fragment            -> out-docker/  (native dockerd)
+#
+# Nothing here duplicates the build logic: every step calls the same
+# build.sh -> docker build / docker run path used locally, plus the existing
+# scripts/finalize.sh, scripts/make-zip.sh and scripts/build-docker-variant.sh.
+# build.sh already bind-mounts the repository into the container
+# (-v "$ROOT:/workspace"), which is why the build tree survives on the host.
+#
+# Persistence (the CI equivalent of a Docker volume), on by default and never
+# destructive:
+#   * Docker layers -> docker/build-push-action GHA cache (toolchain image)
+#   * out/ and out-docker/ -> actions/cache restore/save, so an interrupted or
+#     failed build is resumed next time instead of starting from zero
+#   * a running build is never cancelled by a newer trigger
+#     (cancel-in-progress: false)
+# Set clean_build=true for a from-scratch build.
+#
+# boot.img needs the stock LineageOS boot image as a repack template, which is
+# not in the repository.  Either set the repository variable STOCK_BOOT_URL
+# (Settings -> Secrets and variables -> Actions -> Variables) or pass
+# stock_boot_url when running the workflow manually, and the workflow will
+# download it, build boot.img + the sideload zips, and upload everything.
+# Without it, only Image.gz/Image + the AnyKernel3 zip are produced.
+
+name: Build kernel
+
+on:
+  workflow_dispatch:
+    inputs:
+      target:
+        description: "make target built inside the container"
+        required: false
+        default: "Image.gz"
+        type: string
+      clean_build:
+        description: "ignore the cached build trees and compile from scratch"
+        required: false
+        default: false
+        type: boolean
+      stock_boot_url:
+        description: "direct URL of the stock LineageOS boot.img (optional)"
+        required: false
+        default: ""
+        type: string
+  push:
+    branches:
+      - master
+      - main
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-${{ github.ref }}
+  # never kill a running build: the cache is meant to preserve work, not
+  # throw it away when a newer commit arrives
+  cancel-in-progress: false
+
+env:
+  IMAGE: earth-kernel-abuild:latest
+  # github.event.inputs is empty for a push, so every value has a fallback.
+  TARGET: ${{ github.event.inputs.target || 'Image.gz' }}
+  STOCK_BOOT_URL: ${{ github.event.inputs.stock_boot_url || vars.STOCK_BOOT_URL }}
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: standard
+            out: out
+          - name: docker
+            out: out-docker
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          submodules: false
+
+      # The kernel tree is ~1.4 GB and a build adds ~600 MB on top of the
+      # ~800 MB image; the runner image carries several GB of SDKs we do not
+      # need.  Nothing inside the repository is touched here.
+      - name: Free disk space
+        run: |
+          set -eux
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /opt/hostedtoolcache/CodeQL /usr/local/share/boost
+          sudo docker builder prune -af --filter until=24h || true
+          df -h /
+
+      # Volume-style persistence for this variant's build tree.
+      - name: Restore the previous build tree
+        id: kbuild-cache
+        if: ${{ github.event.inputs.clean_build != 'true' }}
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ matrix.out }}
+          key: kbuild-${{ matrix.out }}-${{ hashFiles('build.sh', 'Dockerfile', 'docker/**', 'configs/**', 'scripts/**') }}-${{ github.sha }}
+          restore-keys: |
+            kbuild-${{ matrix.out }}-${{ hashFiles('build.sh', 'Dockerfile', 'docker/**', 'configs/**', 'scripts/**') }}-
+            kbuild-${{ matrix.out }}-
+
+      - name: Build tree state
+        env:
+          OUT_DIR: ${{ matrix.out }}
+        run: |
+          if [ -f "$OUT_DIR/.config" ]; then
+            echo "restored $OUT_DIR from cache ($(du -sh "$OUT_DIR" | cut -f1))"
+          else
+            echo "no cached $OUT_DIR, starting from scratch"
+          fi
+
+      # Hosted runners already run dockerd; self-hosted ones often do not.
+      - name: Make sure the Docker daemon is running
+        run: |
+          set -eux
+          if ! docker info >/dev/null 2>&1; then
+            echo "docker daemon not reachable, trying to start it"
+            sudo service docker start || true
+            for _ in $(seq 1 30); do
+              docker info >/dev/null 2>&1 && break
+              sleep 2
+            done
+          fi
+          docker info
+          docker version
+
+      # Optional: keeps the 800 MB toolchain image from being rebuilt from
+      # scratch on every run.  If caching is unavailable the next step simply
+      # builds the image normally.
+      - name: Set up Docker Buildx
+        continue-on-error: true
+        uses: docker/setup-buildx-action@v3
+
+      - name: Prime the Docker layer cache
+        continue-on-error: true
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          tags: ${{ env.IMAGE }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # ---- everything below is exactly what ./build.sh does locally ----
+
+      - name: Build the Docker image
+        run: ./build.sh image
+
+      - name: Configure
+        env:
+          VARIANT: ${{ matrix.name }}
+          OUT_DIR: ${{ matrix.out }}
+        run: |
+          set -eux
+          if [ "$VARIANT" = "docker" ]; then
+            OUT="$OUT_DIR" ./build.sh defconfig configs/apatch.fragment configs/docker.fragment
+          else
+            OUT="$OUT_DIR" ./build.sh defconfig configs/apatch.fragment
+          fi
+
+      - name: Check the configuration APatch needs
+        env:
+          VARIANT: ${{ matrix.name }}
+          OUT_DIR: ${{ matrix.out }}
+        run: |
+          set -eux
+          grep -x 'CONFIG_KALLSYMS=y'     "$OUT_DIR/.config"
+          grep -x 'CONFIG_KALLSYMS_ALL=y' "$OUT_DIR/.config"
+          grep -x 'CONFIG_DEBUG_KERNEL=y' "$OUT_DIR/.config"
+          if grep -q '^CONFIG_RANDOMIZE_BASE=y' "$OUT_DIR/.config"; then
+            echo "CONFIG_RANDOMIZE_BASE=y gives a PIE link; kptools cannot patch it" >&2
+            exit 1
+          fi
+          if [ "$VARIANT" = "docker" ]; then
+            while read -r sym; do
+              grep -qx "CONFIG_${sym}=y" "$OUT_DIR/.config" \
+                || { echo "missing CONFIG_${sym}=y (docker.fragment)" >&2; exit 1; }
+            done < <(grep -oP '^CONFIG_\K[A-Z0-9_]+(?==y)' configs/docker.fragment)
+          fi
+
+      - name: Build
+        env:
+          OUT_DIR: ${{ matrix.out }}
+        run: OUT="$OUT_DIR" ./build.sh build "$TARGET"
+
+      - name: Show kernel banner
+        env:
+          OUT_DIR: ${{ matrix.out }}
+        run: |
+          set -eux
+          ls -lh "$OUT_DIR/arch/arm64/boot/"
+          if [ -f "$OUT_DIR/arch/arm64/boot/Image" ]; then
+            strings "$OUT_DIR/arch/arm64/boot/Image" | grep -m1 '^Linux version'
+          fi
+
+      # Optional, only when a stock boot image URL is configured.
+      - name: Fetch the stock boot template
+        env:
+          OUT_DIR: ${{ matrix.out }}
+        run: |
+          set -eux
+          if [ -z "${STOCK_BOOT_URL:-}" ]; then
+            echo "no STOCK_BOOT_URL set: boot.img will not be built in CI"
+            exit 0
+          fi
+          mkdir -p output
+          curl -fL --retry 3 --retry-delay 5 -o output/boot-stock-lineage.img "$STOCK_BOOT_URL"
+          ls -l output/boot-stock-lineage.img
+
+      - name: Package
+        env:
+          VARIANT: ${{ matrix.name }}
+          OUT_DIR: ${{ matrix.out }}
+        run: |
+          set -eux
+          command -v zip >/dev/null || sudo apt-get install -y zip
+          if [ ! -f "$OUT_DIR/arch/arm64/boot/Image.gz" ]; then
+            echo "target is not Image.gz, skipping boot.img and zip packaging"
+            exit 0
+          fi
+          if [ "$VARIANT" = "docker" ]; then
+            # Handles a missing template by skipping boot-docker.img and still
+            # producing the AnyKernel3 zip.
+            SKIP_BUILD=1 scripts/build-docker-variant.sh
+          elif [ -f output/boot-stock-lineage.img ]; then
+            # finalize.sh/make-zip.sh use out/ and output/, which is exactly
+            # this matrix entry (name: standard, out: out).
+            scripts/finalize.sh
+            scripts/make-bootimg-zip.sh output/boot.img
+          else
+            scripts/make-zip.sh
+          fi
+
+      - name: Collect artifacts and checksums
+        env:
+          OUT_DIR: ${{ matrix.out }}
+        run: |
+          set -eux
+          mkdir -p release
+          for f in \
+            "$OUT_DIR/arch/arm64/boot/Image.gz" \
+            "$OUT_DIR/arch/arm64/boot/Image" \
+            "$OUT_DIR/.config" \
+            "$OUT_DIR/include/config/kernel.release"
+          do
+            if [ -f "$f" ]; then
+              name="$(basename "$f")"
+              if [ "$name" = ".config" ]; then name="kernel.config"; fi
+              cp "$f" "release/$name"
+            fi
+          done
+          for f in output/*.zip output/*.img; do
+            if [ ! -f "$f" ]; then continue; fi
+            name="$(basename "$f")"
+            if [ "$name" = "boot-stock-lineage.img" ]; then continue; fi
+            cp "$f" "release/$name"
+          done
+          ( cd release && sha256sum ./* > sha256sums.txt && cat sha256sums.txt )
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: earth-kernel-${{ matrix.name }}-${{ github.run_number }}-${{ github.run_attempt }}
+          path: release/*
+          retention-days: 30
+          if-no-files-found: error
+
+      # Saved even when an earlier step failed, so the half-built tree is not
+      # lost.  A rerun of the same commit reuses the exact key and skips this.
+      - name: Save the build tree
+        if: always() && !cancelled() && github.event.inputs.clean_build != 'true' && steps.kbuild-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ matrix.out }}
+          key: kbuild-${{ matrix.out }}-${{ hashFiles('build.sh', 'Dockerfile', 'docker/**', 'configs/**', 'scripts/**') }}-${{ github.sha }}
+
+      - name: Job summary
+        if: always()
+        env:
+          VARIANT: ${{ matrix.name }}
+          OUT_DIR: ${{ matrix.out }}
+        run: |
+          {
+            echo "## earth kernel build ($VARIANT)"
+            echo
+            echo "- kernel: \`$(cat "$OUT_DIR/include/config/kernel.release" 2>/dev/null || echo n/a)\`"
+            echo "- target: \`$TARGET\`"
+            echo "- build tree: \`$OUT_DIR\`"
+            echo "- build tree cache: \`${{ steps.kbuild-cache.outputs.cache-hit == 'true' && 'hit (exact)' || 'restored previous / empty' }}\`"
+            echo "- stock boot template: \`$([ -f output/boot-stock-lineage.img ] && echo yes || echo no)\`"
+            echo
+            echo '```'
+            cat release/sha256sums.txt 2>/dev/null || echo "artifacts were not produced"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

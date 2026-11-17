@@ -31,7 +31,8 @@ fi
 KPIMG="${KPIMG:-$(dirname "$KPTOOLS")/kpimg-linux}"
 [[ -f "$KPIMG" ]] || { echo "kpimg not found next to kptools: $KPIMG" >&2; exit 1; }
 
-CONFIG="$ROOT/out/.config"
+CONFIG="${CONFIG:-$(cd "$(dirname "$IMG")/../../../.." && pwd)/.config}"
+[[ -f "$CONFIG" ]] || CONFIG="$ROOT/out/.config"
 if [[ -f "$CONFIG" ]]; then
   echo "== config"
   grep -E '^CONFIG_(DEBUG_KERNEL|KALLSYMS|KALLSYMS_ALL|KALLSYMS_BASE_RELATIVE|LTO_CLANG|CFI_CLANG|SHADOW_CALL_STACK|KSU)=' "$CONFIG" || true

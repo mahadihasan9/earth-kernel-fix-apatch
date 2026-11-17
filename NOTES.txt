@@ -14,6 +14,14 @@
  repacks a boot image in the stock layout.  It does not modify the ramdisk and
  does not re-sign AVB.
 
+ Two kernel variants can be produced from the same source (section 13):
+   standard       configs/apatch.fragment                  -> out/,  output/boot.img
+   docker         + configs/docker.fragment                -> out-docker/,
+                  output/boot-docker.img  (native dockerd on the device)
+ The standard image deliberately stays without the container options.
+
+ CI: .github/workflows/build.yaml builds both variants in Docker (section 14).
+
 
 2. Kernel config that matters
 --------------------------------------------------------------------------------
@@ -293,6 +301,10 @@
  [ ] scripts/verify-patch.sh              -> "OK: kernel is APatch/KernelPatch patchable"
  [ ] scripts/finalize.sh                  -> output/boot.img + AnyKernel3 zip
  [ ] scripts/make-bootimg-zip.sh output/boot.img
+ [ ] (docker variant) OUT=out-docker ./build.sh defconfig configs/apatch.fragment configs/docker.fragment
+ [ ] (docker variant) scripts/build-docker-variant.sh   -> output/boot-docker.img + docker zips
+ [ ] (on the phone)   scripts/termux-dockerd.sh doctor    -> all kernel features ok
+ [ ] (on the phone)   scripts/termux-dockerd.sh start     -> docker info works
  [ ] repacker self-test still byte-identical with the stock kernel
  [ ] strings out/arch/arm64/boot/Image | grep "Linux version"   (sanity)
  [ ] grep -ri kernelsu --include='*.c' --include='*.h' . | head  (must be empty)
@@ -309,4 +321,162 @@
  - AnyKernel3 must not ship dtb/dtbo on this device.
  - Swapping ramdisks between LineageOS builds: the ramdisk belongs to the ROM;
    this toolkit only replaces the kernel.
+
+
+13. Optional Docker-enabled variant (native dockerd, no chroot)
+--------------------------------------------------------------------------------
+ Why a separate image: running dockerd natively on the phone (Termux + root,
+ no proot/chroot) needs kernel features the stock LineageOS config leaves off:
+ namespaces, most cgroup controllers, overlayfs upperdirs, and veth/bridge with
+ iptables NAT.  Putting those into the normal kernel would grow the attack
+ surface for everyone, so they live in their own fragment and their own boot
+ image.  The standard image in output/boot.img does NOT get them.
+
+ Files
+   configs/docker.fragment          48 "=y" options: namespaces, cgroup
+                                    controllers, overlayfs, veth/bridge/vxlan/
+                                    macvlan/ipvlan, netfilter NAT, mqueue,
+                                    keys, seccomp, netlink diag
+   scripts/build-docker-variant.sh  configure + build + repack + zip for the
+                                    variant; writes only to out-docker/ and to
+                                    docker-named files in output/
+
+ Build
+   scripts/build-docker-variant.sh                       full run
+   SKIP_BUILD=1 scripts/build-docker-variant.sh          package an existing build
+   TEMPLATE=/path/to/stock-boot.img scripts/build-docker-variant.sh
+ or step by step:
+   OUT=out-docker ./build.sh defconfig configs/apatch.fragment configs/docker.fragment
+   OUT=out-docker ./build.sh build Image.gz
+
+ Outputs (distinct names, nothing overwritten)
+   output/boot-docker.img
+   output/earth-apatch-docker-<krel>-<stamp>.zip        AnyKernel3, kernel only
+   output/earth-apatch-docker-bootimg-<stamp>.zip       full-image sideload zip
+   output/sha256sums-docker.txt                         checksums of the three
+ out-docker/ is the variant build tree and is gitignored.  Deleting it only
+ throws away the variant's incremental state; out/ and the release files of the
+ normal kernel are untouched.
+
+ Config check done while writing this
+ (OUT=out-docker ./build.sh defconfig configs/apatch.fragment configs/docker.fragment):
+   - 48/48 fragment symbols end up "=y" after olddefconfig
+   - CONFIG_KALLSYMS, KALLSYMS_ALL, DEBUG_KERNEL stay "=y"
+   - CONFIG_RANDOMIZE_BASE stays off, so kptools can still patch the image
+   - the only warnings are the vendor ones that also show up on the standard
+     build (MTK_SECURE_MEM_SUPPORT, MTK_CACHE_PARITY_CHECK unmet deps)
+
+ Full variant build (2026-11-17, same GCC 11 image)
+   Linux version 4.19.325-cip136-st20 (gcc 11.4.0) #1 SMP PREEMPT
+   48/48 docker symbols "=y", APatch symbols unchanged
+   scripts/verify-patch.sh out-docker/arch/arm64/boot/Image tools/kptools-linux
+     -> OK: kernel is APatch/KernelPatch patchable (kptools 0.13.9 / kpimg d09)
+   sha256
+     4d3b6f0e38cb3a059cd92683c8edd99e06b132ca161d8f5f1ecbbafb21046831  boot-docker.img
+     bda73f06fe316e3c7410ba92bbf598c3c5753fdc5ce6992d372fa6b3f182464e  earth-apatch-docker-4.19.325-cip136-st20-20261117-2236.zip
+     586615491c65be972d4e36e5f51bd6f19d232bd345e03f12fed978aee086b416  earth-apatch-docker-bootimg-20261117-2236.zip
+   output/boot.img and the standard zips were byte-for-byte untouched
+   (mtime still 2026-11-15, sha256 e0cff4b5... unchanged)
+
+ Deliberately not set
+   CONFIG_CGROUP_HUGETLB            depends on HUGETLB_PAGE, disabled here
+   CONFIG_IP_VS*                    no IPVS code in this tree at all
+   CONFIG_ANDROID_PARANOID_NETWORK  symbol does not exist in this tree
+
+ APatch ordering is unchanged: patch output/boot-docker.img with APatch, then
+ flash the patched image (fastboot, or put it into the docker bootimg zip as
+ boot.img).  Both fragments are merged, so the Docker image keeps the
+ kallsyms/non-PIE requirements.
+
+ Runtime notes (kernel side only; not verified on the device)
+   - dockerd must see the cgroup v1 controllers; Android mounts parts of
+     /sys/fs/cgroup read-only, so the daemon usually needs cgroupfs writable
+     or a dedicated mount namespace
+   - overlay2 needs the upperdir on a filesystem that allows trusted xattrs;
+     if SELinux blocks it, the vfs storage driver works but is much slower
+   - iptables (legacy) needs the NAT/filter targets enabled above; Docker's own
+     check-config.sh is a good sanity check
+   - CONFIG_USER_NS is wanted for rootless mode and was already "=y" in the
+     vendor config
+
+ Docker daemon on the device: scripts/termux-dockerd.sh
+   Host-side helper, no chroot and no proot.  It does not modify build.sh; it
+   prepares the daemon and exports DOCKER_HOST for the normal entry points.
+     doctor   read /proc/config.gz + /proc/cgroups, probe veth/bridge creation
+     setup    download the static Docker tarball for aarch64 (27.3.1) into
+              ~/.local/docker (docker, dockerd, containerd, runc)
+     start    dockerd via `su`, socket chmod 666, data-root outside the repo
+     stop     kill the daemon via its pidfile
+     status   docker info + state directories
+     image    docker build --network host (NAT-free containers still build)
+     build    exec ./build.sh "$@" with DOCKER_HOST already set
+     logs     tail ~/.local/share/dockerd.log
+   State is persistent and lives outside the repository:
+     ~/.local/docker/                 binaries
+     ~/.local/share/docker-data/      images/containers ("the volume")
+     ~/.local/share/dockerd.log       daemon log
+     $PREFIX/var/run/docker.sock      socket (666 for the Termux user)
+   Defaults: storage driver vfs (overlay2 usually blocked by SELinux labels);
+   NAT disabled when no iptables binary is found.  Override with
+   DOCKER_STORAGE=overlay2, DOCKER_DATA_ROOT=..., DOCKER_VERSION=...
+   Low-RAM phones: build.sh uses -j$(nproc); the README shows the explicit
+   `docker run ... -e JOBS=4` fallback.
+
+14. GitHub Actions workflow (build.yaml)
+--------------------------------------------------------------------------------
+ .github/workflows/build.yaml (the only workflow file) builds both kernel
+ variants in the same Docker image used locally.  It only calls build.sh,
+ scripts/finalize.sh, scripts/make-zip.sh and scripts/build-docker-variant.sh,
+ so there is no second copy of the build logic to keep in sync.
+
+ Matrix (two parallel jobs, fail-fast: false)
+   standard  configs/apatch.fragment      -> out/        -> earth-kernel-standard-*
+   docker    + configs/docker.fragment    -> out-docker/ -> earth-kernel-docker-*
+
+ Triggers
+   push to master/main   automatic build of both variants on every push
+   push tag v*           automatic build of both variants
+   workflow_dispatch     inputs: target (Image.gz), clean_build (false),
+                         stock_boot_url (optional direct URL of the stock boot.img)
+
+ Automatic boot.img: the stock boot image is not in the repository, so the
+ workflow takes it from
+   - the workflow_dispatch input stock_boot_url, or
+   - the repository variable STOCK_BOOT_URL
+     (Settings -> Secrets and variables -> Actions -> Variables)
+ When one of them is set, the file is downloaded to
+ output/boot-stock-lineage.img and the normal packaging path runs:
+   standard -> scripts/finalize.sh + scripts/make-bootimg-zip.sh
+               (boot.img, AnyKernel3 zip, full-image sideload zip)
+   docker   -> SKIP_BUILD=1 scripts/build-docker-variant.sh
+               (boot-docker.img, docker AnyKernel3 zip, docker bootimg zip)
+ Without it, the standard job still produces the AnyKernel3 zip via
+ make-zip.sh, and the docker variant does the same (its script skips
+ boot-docker.img and prints a warning).
+
+ Persistence ("volume" behaviour), on by default, nothing destructive
+   - docker/build-push-action GHA cache for the 800 MB toolchain image
+   - actions/cache restore/save of out/ and out-docker/, keyed by script/config
+     hash + commit SHA, with prefix restore-keys for incremental reuse
+   - saved with if: always(), so a failed or interrupted run is resumed
+     instead of restarted
+   - concurrency cancel-in-progress: false, so a newer push never kills a
+     running build
+   - clean_build=true skips restore/save for a from-scratch build
+
+ Artifacts (earth-kernel-<variant>-<run>-<attempt>, kept 30 days)
+   Image.gz, Image, kernel.config, kernel.release, whatever boot image / zips
+   the packaging step produced, and sha256sums.txt.
+
+ Notes
+   - both jobs share the toolchain image cache but not the kernel objects, so
+     the first cold run takes roughly 40-60 minutes per variant
+   - every push to master/main builds both variants; warm caches make repeat
+     builds incremental (usually a few minutes)
+   - build.yml (the earlier single-job version) was replaced by build.yaml;
+     keep exactly one workflow file so a tag push does not build twice
+
+ Validation done while writing it: YAML parses, all 18 steps pass bash -n, the
+ matrix and inputs are correct, and the job env resolves both for a push
+ (empty inputs) and for workflow_dispatch.
 ================================================================================

@@ -38,6 +38,10 @@ Grab these from [Releases](../../releases):
 | `earth-apatch-<kernelver>-<date>.zip` | AnyKernel3 package, kernel only (for a non-APatch setup) |
 | `boot-stock-lineage.img` | Untouched stock boot image — rollback |
 
+For native Docker on the phone, the `docker`-named files from
+[Docker on the device](#docker-on-the-device-termux--root) are used instead;
+the standard files above stay APatch-only.
+
 ### 1. Patch the boot image with APatch
 
 1. Copy `boot.img` to the phone.
@@ -234,6 +238,273 @@ ramdisk must match the ROM.
 
 Useful overrides: `IMAGE=`, `KERNEL_SRC=`, `OUT=`, `JOBS=`, `KCFLAGS=`.
 
+### Optional: Docker-enabled variant (native dockerd)
+
+The normal kernel deliberately does not carry the container options. If you
+want to run a native Docker daemon on the phone (Termux + root, no chroot),
+build the second variant — same sources and toolchain, plus
+`configs/docker.fragment`:
+
+```sh
+scripts/build-docker-variant.sh
+```
+
+It builds into `out-docker/` and produces distinctly named files, so the
+normal build is never touched:
+
+| File | What it is |
+|---|---|
+| `output/boot-docker.img` | Docker-enabled kernel in the stock boot layout |
+| `output/earth-apatch-docker-<ver>-<stamp>.zip` | AnyKernel3, kernel only |
+| `output/earth-apatch-docker-bootimg-<stamp>.zip` | full-image sideload zip |
+
+`output/sha256sums-docker.txt` holds their checksums. `SKIP_BUILD=1` repacks
+an existing build, and `TEMPLATE=/path/to/stock.img` points at a different
+stock boot image. Patch `boot-docker.img` with APatch exactly like the normal
+image.
+
+The fragment enables namespaces, the cgroup controllers, overlayfs,
+veth/bridge, VXLAN/MACVLAN/IPVLAN and the iptables NAT targets that dockerd
+needs. It does not enable IPVS (absent from this tree) or the hugetlb cgroup
+(`HUGETLB_PAGE` is off). Runtime notes: `NOTES.txt` section 13.
+
+## Docker on the device (Termux + root)
+
+With `boot-docker.img` flashed, the phone runs a **real `dockerd`** — no proot,
+no chroot, no PC. `scripts/termux-dockerd.sh` is the helper: it downloads the
+static Docker binaries, starts/stops the daemon with a persistent data root,
+and hands the normal `build.sh` a working `DOCKER_HOST`.
+
+```
+APatch-patched boot-docker.img  ->  dockerd (root, Termux)  ->  docker run / ./build.sh
+```
+
+### Prerequisites
+
+| | |
+|---|---|
+| Kernel | Docker-enabled variant (`output/boot-docker.img`) on **both** slots |
+| Root | APatch (or another root) with a working `su` |
+| Termux | `pkg install curl tar` — `pkg install iproute2` for the `doctor` probes |
+| Space | ~10 GB free on `/data` (Docker binaries ~70 MB + images + build tree) |
+| RAM | 4 GB is enough for containers; a kernel build wants more (see below) |
+
+The standard `boot.img` does **not** have the container options. If
+`/proc/config.gz` shows `CONFIG_NAMESPACES` or `CONFIG_VETH` missing, the wrong
+kernel is running — flash `boot-docker.img` first.
+
+### Quick start
+
+```sh
+pkg install curl tar iproute2
+cd ~/earth-kernel-fix-apatch
+
+bash scripts/termux-dockerd.sh doctor   # 1. is the kernel ready?
+bash scripts/termux-dockerd.sh setup    # 2. static Docker 27.3.1 (aarch64)
+bash scripts/termux-dockerd.sh start    # 3. dockerd via su
+docker run --rm hello-world             # 4. it works
+```
+
+Step 4 is the real proof: pulling an image uses the daemon's own network, so it
+works even when container NAT is unavailable.
+
+### 1. Flash the Docker kernel
+
+Patch `output/boot-docker.img` with APatch exactly like the normal image, then
+flash the **patched** file to both slots (same rules as
+[Download and install](#download-and-install-no-build-required)):
+
+```sh
+fastboot flash boot_a apatch-patched-docker.img
+fastboot flash boot_b apatch-patched-docker.img
+fastboot reboot
+```
+
+Rollback is always the untouched `output/boot-stock-lineage.img`.
+
+### 2. Set up Termux
+
+```sh
+pkg update
+pkg install curl tar iproute2
+```
+
+`iproute2` is optional; without it `doctor` simply skips the veth/bridge probes.
+Everything installed by the helper lives outside the repository:
+
+```
+~/.local/docker/                 docker, dockerd, containerd, runc
+~/.local/share/docker-data/      images, containers, volumes (the "volume")
+~/.local/share/dockerd.log       daemon log (scripts/termux-dockerd.sh logs)
+$PREFIX/var/run/docker.sock      socket, chmod 666 for the Termux user
+```
+
+Because the data root is a normal directory on `/data`, **images and containers
+survive reboots and daemon restarts**. Deleting that directory is the only way
+to lose them; back it up with
+
+```sh
+tar -C ~/.local/share -czf docker-data-backup.tar.gz docker-data
+```
+
+### 3. Check, install, start
+
+`doctor` reads `/proc/config.gz` (through `su` if needed) and probes the live
+kernel:
+
+```sh
+bash scripts/termux-dockerd.sh doctor
+```
+
+Expected highlights:
+
+```
+ok      CONFIG_NAMESPACES
+ok      CONFIG_MEMCG
+ok      CONFIG_OVERLAY_FS
+ok      CONFIG_VETH
+ok      CONFIG_BRIDGE
+ok      veth pairs can be created
+ok      bridge devices can be created
+```
+
+Then:
+
+```sh
+bash scripts/termux-dockerd.sh setup    # once: static Docker tarball
+bash scripts/termux-dockerd.sh start    # dockerd, persistent data root
+bash scripts/termux-dockerd.sh status   # docker info + state paths
+```
+
+`start` prints the socket and the data directory, and is safe to run twice — if
+the daemon is already up it just says so. To keep it running after Termux is
+reopened, add one line to `~/.bashrc`:
+
+```sh
+bash ~/earth-kernel-fix-apatch/scripts/termux-dockerd.sh start >/dev/null 2>&1 || true
+```
+
+### 4. Run containers
+
+The script exports `DOCKER_HOST` for itself, but your shell needs it too:
+
+```sh
+export DOCKER_HOST=unix://$PREFIX/var/run/docker.sock
+```
+
+Put that line in `~/.bashrc` next to the `start` line.
+
+```sh
+docker run --rm hello-world                       # smoke test
+docker run --rm -it --network host alpine sh      # shell, host network
+docker run --rm --network host ubuntu:24.04 uname -a
+docker ps -a                                      # containers
+docker images                                     # images
+docker system df                                  # disk usage
+docker logs <container>                           # output
+docker rm <container>; docker rmi <image>         # cleanup
+docker system prune -af                           # reclaim space
+```
+
+Two phone-specific rules:
+
+- **Use `--network host`** for anything that needs the internet (package
+  installs, `git clone`, registry-less builds). Without an `iptables` binary the
+  daemon disables NAT, so the default bridge has no outbound route.
+- **`-p 8080:80` needs iptables.** With NAT disabled, reach the service on
+  `127.0.0.1:80` through `--network host` instead of publishing a port.
+
+A bind mount is the usual way to share files with the phone:
+
+```sh
+docker run --rm -it --network host \
+  -v "$HOME/storage/shared:/work" -w /work alpine sh
+```
+
+(`termux-setup-storage` once, so `~/storage/shared` points at internal storage.)
+
+### 5. Build the kernel with it
+
+```sh
+bash scripts/termux-dockerd.sh image    # docker build, host network, once
+bash scripts/termux-dockerd.sh build defconfig configs/apatch.fragment configs/docker.fragment
+bash scripts/termux-dockerd.sh build build Image.gz
+```
+
+`image` uses `--network host`, so `apt-get` inside the Dockerfile works even
+with NAT disabled. Anything else goes through the normal entry points:
+
+```sh
+export DOCKER_HOST=unix://$PREFIX/var/run/docker.sock
+./build.sh defconfig configs/apatch.fragment
+./build.sh build Image.gz
+```
+
+A full kernel build on the phone is slow (hours) and can exhaust RAM because
+`build.sh` uses `-j$(nproc)`. Use fewer jobs on a 4 GB device:
+
+```sh
+docker run --rm -it --user "$(id -u):$(id -g)" -e HOME=/tmp -e JOBS=4 \
+  -v "$PWD:/workspace" -w /workspace earth-kernel-abuild:latest \
+  bash docker/kernel-build.sh build Image.gz
+```
+
+### 6. Stop
+
+```sh
+bash scripts/termux-dockerd.sh stop    # daemon only; images stay on disk
+bash scripts/termux-dockerd.sh logs    # last 80 lines if something failed
+```
+
+Run `stop` before uninstalling Docker or flashing another kernel. Nothing is
+deleted automatically — to start clean, remove `~/.local/share/docker-data`
+(and optionally `~/.local/docker`).
+
+### Docker troubleshooting
+
+| Symptom | Fix |
+|---|---|
+| `permission denied` on `docker.sock` | `start` chmods it to 666; rerun `start`, or export the right `DOCKER_HOST` |
+| `Cannot connect to the Docker daemon` | daemon not up: `scripts/termux-dockerd.sh start`, then `status` |
+| `dockerd` exits immediately | `scripts/termux-dockerd.sh logs`; usually cgroup/SELinux or a missing kernel option — `doctor` tells you which |
+| `operation not permitted` while creating a container | storage driver: keep the default `vfs`, or try `DOCKER_STORAGE=overlay2 ... start` only if the ROM allows xattrs |
+| container has no internet | add `--network host` (NAT is off without iptables) |
+| `-p` port not reachable | same reason — use `--network host` and connect to the container port |
+| `no space left on device` | `docker system prune -af`, and remember `vfs` copies every layer in full |
+| build killed (OOM) | rerun with `-e JOBS=4` as shown above |
+| `doctor` reports missing `CONFIG_*` | the standard kernel is running; flash the APatch-patched `boot-docker.img` |
+
+Kernel-side details and the full option list are in `NOTES.txt` section 13.
+`DOCKER_VERSION`, `DOCKER_STORAGE`, `DOCKER_DATA_ROOT`, `DOCKER_LOG`, `IMAGE`
+can be overridden as environment variables.
+
+### GitHub Actions
+
+`.github/workflows/build.yaml` builds **both variants automatically** in the
+same Docker pipeline:
+
+| Job | Config | Build tree | Artifact |
+|---|---|---|---|
+| `standard` | `configs/apatch.fragment` | `out/` | `earth-kernel-standard-<run>-<attempt>` |
+| `docker` | + `configs/docker.fragment` | `out-docker/` | `earth-kernel-docker-<run>-<attempt>` |
+
+- runs on every push to `master`/`main`, on `v*` tags, and manually
+  (`workflow_dispatch`);
+- inputs: `target` (default `Image.gz`), `clean_build` (from scratch),
+  `stock_boot_url` (optional);
+- reuses `build.sh`, `finalize.sh`, `make-zip.sh` and
+  `build-docker-variant.sh`, so a CI build and a local build are identical;
+- caches the Docker layers and the build trees, so a rerun continues instead
+  of starting over — `clean_build` forces a fresh one;
+- uploads `Image.gz`, `Image`, `kernel.config`, `kernel.release`, whatever
+  boot images/zips were produced, and `sha256sums.txt`.
+
+`boot.img` needs the stock boot template, which is not in the repository. Set
+the repository variable `STOCK_BOOT_URL` (Settings → Secrets and variables →
+Actions → Variables) or pass `stock_boot_url` on a manual run, and CI will
+download it and build `boot.img`, `boot-docker.img` and the sideload zips too.
+Without it you only get `Image.gz`/`Image` and the AnyKernel3 zip.
+
 ### Source changes
 
 The tree in `android_kernel_xiaomi_earth/` is the LineageOS
@@ -269,17 +540,22 @@ build.sh                     host entry point (docker wrapper)
 Dockerfile                   Ubuntu 22.04 + aarch64 GCC toolchain
 docker/kernel-build.sh       in-container make wrapper + KCFLAGS
 configs/apatch.fragment      APatch-required kernel config
+configs/docker.fragment      optional Docker/containerd options (variant)
 patches/0001-gcc-build-fixes.patch  same fixes, for upstream users
 scripts/repack-boot.py       boot image v2 repacker (kernel swap only)
 scripts/make-zip.sh          AnyKernel3 kernel-only zip
 scripts/make-bootimg-zip.sh  full boot image sideload zip
 scripts/finalize.sh          repack + zip + sha256
+scripts/build-docker-variant.sh  Docker-enabled variant (out-docker/)
+scripts/termux-dockerd.sh    native dockerd on the phone (Termux + root)
 scripts/verify-patch.sh      KernelPatch patchability gate
 scripts/full-build.sh        image + defconfig + build + verify
+.github/workflows/build.yaml  CI: both variants, cached (Docker)
 anykernel3/                  AnyKernel3 (osm0sis) with an earth config
 tools/                       place kptools-linux / kpimg-linux here
 output/                      build artifacts (git-ignored)
 out/                         kernel build tree (git-ignored)
+out-docker/                  Docker variant build tree (git-ignored)
 ```
 
 The kernel tree is committed as plain files (it has no `.git` of its own), so
